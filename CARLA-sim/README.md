@@ -4,8 +4,9 @@
 1. Introduction
 2. VM Configuration & Connect via SSH
 3. Install Chrome Remote Desktop (CRD)
-4. Install NVIDIA Drivers & Download Software
-5. Connect via CRD & Run CARLA
+4. Install NVIDIA Drivers, CARLA, and other required software
+5. Start CRD, Log into GitHub, Setup CARLA
+6. Run CARLA Server and Player
 
 ## 1. Introduction
 
@@ -131,7 +132,10 @@ sudo reboot  # System will reboot
 
 This guide uses the ```ubuntu-drivers-common``` tool to automatically install required drivers. Once reboot is complete, the command ```nvidia-smi``` should now show GPU details.
 
-## 5. Running CARLA via CRD
+## 5. Start CRD, Log into GitHub, Setup CARLA
+
+### **Access the VM through Chrome Remote Desktop.** 
+Commands beyond this point will be entered into the desktop terminal.
 
 ### Log into GitHub
 
@@ -155,11 +159,10 @@ mv CARLA_0.9.16.tar.gz AdditionalMaps_0.9.16.tar.gz HondaAI/CARLA-sim/
 cd HondaAI/CARLA-sim
 tar -xvf CARLA_0.9.16.tar.gz
 tar -xvf AdditionalMaps_0.9.16.tar.gz
-cd ../
 
 # Create virtual environment for python
-python3 -m venv ../.carla-venv
-source ../.carla_venv/bin/activate
+python3 -m venv .carla-venv
+source .carla-venv/bin/activate
 python3 -m pip install numpy pandas matplotlib pygame carla
 
 # Setup CARLA maps & control
@@ -169,10 +172,9 @@ sed -i 's/^bUseMouseForTouch=False$/bUseMouseForTouch=True/' CarlaUE4/Config/Def
 
 Note: CARLA does not correctly handle mouse free-look by default, which is why ```bUseMouseForTouch``` is updated.
 
-### Run CARLA
-Beyond this point, commands should be run in the VM Desktop
+## 6. Run CARLA Server and Player
 
-**For each terminal, ensure current directory is CARLA root folder (~/carla_simulator) and activate the virtual environment (```source .carla_venv/bin/activate```)**
+**For each terminal, ensure current directory is CARLA root folder (~/CARLA-sim) and activate the virtual environment (```source .carla-venv/bin/activate```)**
 
 
 **Terminal Tab 1**
