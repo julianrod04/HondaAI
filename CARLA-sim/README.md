@@ -7,6 +7,17 @@
 4. Install NVIDIA Drivers, CARLA, and other required software
 5. Start CRD, Log into GitHub, Setup CARLA
 6. Run CARLA Server and Player
+7. FAQ
+
+TODO :
+CLARIFY GPU TAB DURING VM CONFIG CREATION
+
+SYNCHRONIZE CLIPBOARD FOR CRD
+
+FAQ
+HOW WILL THIS CHARGE ME
+HOW DO I COPY PASTE
+WHERE DO I START THE VM
 
 ## 1. Introduction
 
@@ -14,9 +25,9 @@ This is a guide on how to run CARLA Simulator on a Google Cloud Virtual Machine 
 
 This guide does NOT cover how to setup a Google Cloud account. Cloud fees may apply. As of October 2025, Google Cloud is offering a 90-day, $300 free trial. Learn more here: https://cloud.google.com/free/docs/free-cloud-features.
 
-## 2. VM Configuration & Connect via SSH
+## 2. Configure VM & Connect via SSH
 
-After setting up a Google Cloud account with funds, create a compute VM instance.
+After setting up a Google Cloud account with funds and enabling the Compute Engine API, create a compute VM instance.
 
 1. Start from the Google Cloud Console (homepage)
 2. Go to the navigation menu
