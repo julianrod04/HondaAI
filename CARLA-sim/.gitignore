@@ -1,0 +1,10 @@
+# Ignore everything in sub1
+*
+
+# But keep these folders
+!CustomPython/
+!DataLogs/
+
+# And keep this .gitignore file itself
+!.gitignore
+
