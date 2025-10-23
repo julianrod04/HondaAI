@@ -1,0 +1,13 @@
+hero xyzyaw 20 248 0 0
+npc spawn right --lat 3.6 --bp vehicle.audi.tt
+
+log start both --dir DataLogs
+
+hero speed 7
+npc speed 8
+
+log stop
+
+status
+cleanup
+exit

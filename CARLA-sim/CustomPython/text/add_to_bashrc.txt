@@ -1,0 +1,32 @@
+carlaserver() {
+  cd /home/$USER/HondaAI/CARLA-sim || return
+
+  # activate venv in *current* shell
+  source .carla-venv/bin/activate
+  
+  # start the server (foreground)
+  ./CarlaUE4.sh "$@"
+}
+
+carladrive() {
+  cd /home/$USER/HondaAI/CARLA-sim || return
+  # activate venv in *current* shell
+  source .carla-venv/bin/activate
+  # start manual control
+  python3 ./PythonAPI/util/config.py --map Town06
+  python3 ./PythonAPI/examples/manual_control.py "$@"
+  # when Carla exits, you'll still be inside the venv
+}
+carlashell() {
+  cd /home/$USER/HondaAI/CARLA-sim || return
+
+  # activate venv in *current* shell
+  source .carla-venv/bin/activate
+
+  # start the carla shell
+  python3 ./CustomPython/carla_shell.py
+}
+
+carlavenv(){
+  source /home/$USER/HondaAI/CARLA-sim/.carla-venv/bin/activate
+}
