@@ -7,8 +7,12 @@
 # Keep CustomPython and all files inside it
 !CustomPython/
 !CustomPython/**
+# Drop Windows metadata that sneaks in there
+CustomPython/**/[Dd]esktop.ini
 
 # Keep DataLogs and all files inside it
 !DataLogs/
 !DataLogs/**
+# Drop Windows metadata that sneaks in there
+DataLogs/**/[Dd]esktop.ini
 

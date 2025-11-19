@@ -5,7 +5,7 @@ Monitors vehicle positions and time, automatically respawning when conditions ar
 import threading
 import time
 import carla
-from typing import Optional
+from typing import Optional, Callable, List
 
 
 class AutoRespawnMonitor:
@@ -14,7 +14,8 @@ class AutoRespawnMonitor:
     def __init__(self, world: carla.World, ego_spawn_point: carla.Transform, 
                  npc_spawn_point: carla.Transform, ego_blueprint: carla.ActorBlueprint, 
                  npc_blueprint: carla.ActorBlueprint, camera_blueprint: carla.ActorBlueprint, 
-                 camera_transform: carla.Transform, display, 
+                 camera_transform: carla.Transform, display=None,
+                 camera_callback: Optional[Callable[[carla.Image], None]] = None,
                  spawn_x_threshold: float = 200, time_threshold: float = 30):
         """
         Initialize the auto-respawn monitor.
@@ -27,7 +28,8 @@ class AutoRespawnMonitor:
             npc_blueprint: Blueprint for NPC vehicle
             camera_blueprint: Blueprint for camera sensor
             camera_transform: Transform for camera relative to vehicle
-            display: Display handler (CarlaDisplay) for camera images
+            display: Optional display handler (CarlaDisplay) for camera images
+            camera_callback: Optional callback invoked with each camera image
             spawn_x_threshold: Distance in x direction to trigger respawn (default: 200)
             time_threshold: Time in seconds to trigger respawn (default: 30)
         """
@@ -39,6 +41,11 @@ class AutoRespawnMonitor:
         self.camera_blueprint = camera_blueprint
         self.camera_transform = camera_transform
         self.display = display
+        self.camera_callbacks: List[Callable[[carla.Image], None]] = []
+        if display is not None:
+            self.camera_callbacks.append(display.on_image)
+        if camera_callback is not None:
+            self.camera_callbacks.append(camera_callback)
         
         self.spawn_x = ego_spawn_point.location.x
         self.x_threshold = self.spawn_x + spawn_x_threshold
@@ -55,6 +62,24 @@ class AutoRespawnMonitor:
         self.running = False
         self.monitor_thread: Optional[threading.Thread] = None
         
+    def add_camera_callback(self, callback: Callable[[carla.Image], None]):
+        """Register additional camera callbacks (deduplicated)."""
+        if callback not in self.camera_callbacks:
+            self.camera_callbacks.append(callback)
+    
+    def _relay_camera_image(self, image: carla.Image):
+        """Fan-out camera images to registered callbacks."""
+        for callback in list(self.camera_callbacks):
+            try:
+                callback(image)
+            except Exception as exc:
+                print(f"Camera callback error: {exc}")
+    
+    @staticmethod
+    def _discard_image(image: carla.Image):
+        """Fallback no-op camera sink."""
+        return
+    
     def respawn_vehicles(self):
         """Destroy and respawn both vehicles and camera."""
         print("Respawn triggered!")
@@ -82,9 +107,23 @@ class AutoRespawnMonitor:
             self.camera_transform, 
             attach_to=self.ego_vehicle
         )
-        self.camera.listen(self.display.on_image)
+        callback = self._relay_camera_image if self.camera_callbacks else self._discard_image
+        self.camera.listen(callback)
         
         print(f"Vehicles respawned at x={self.spawn_x} (ego_autopilot={self.ego_autopilot}, npc_autopilot={self.npc_autopilot})")
+        return self.ego_vehicle, self.npc_vehicle, self.camera
+    
+    def force_respawn(self, ego_autopilot: Optional[bool] = None, 
+                      npc_autopilot: Optional[bool] = None):
+        """
+        Synchronously respawn vehicles and camera without starting the monitor thread.
+        Useful for RL environments that own the simulation loop.
+        """
+        if ego_autopilot is not None:
+            self.ego_autopilot = ego_autopilot
+        if npc_autopilot is not None:
+            self.npc_autopilot = npc_autopilot
+        return self.respawn_vehicles()
     
     def _monitor_loop(self):
         """Main monitoring loop running in background thread."""
