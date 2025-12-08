@@ -102,10 +102,6 @@ class CarlaParquetLogger:
         self._closed = False
         print(f"[CarlaParquetLogger] Logging to: {self.file_path}")
 
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
-
     def log_step(self, control):
         """
         Log one simulation frame.
