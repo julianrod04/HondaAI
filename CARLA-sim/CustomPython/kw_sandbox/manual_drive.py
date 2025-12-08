@@ -3,17 +3,75 @@ import random
 import pygame
 import math
 import time
+import os
 # from csv_logging import CarlaCSVLogger
 from parquet_logger import CarlaParquetLogger
 from steering_control import get_wheel_control, get_keyboard_control
 from waypoint import find_adjacent_lane_waypoint, find_forward_waypoint
 
 def main():
+    # Configure SDL2 environment variables for better XInput/Xbox controller support
+    # These must be set BEFORE pygame.init()
+    os.environ['SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS'] = '1'
+    # Force SDL to use HIDAPI backend (better for XInput devices)
+    os.environ['SDL_JOYSTICK_HIDAPI'] = '1'
+    # Enable XInput support explicitly
+    os.environ['SDL_HINT_JOYSTICK_HIDAPI_XBOX'] = '1'
+    
     pygame.init()
     screen = pygame.display.set_mode((400, 200))
     pygame.display.set_caption("CARLA Manual Control (focus here, use WASD, R for reverse)")
 
     pygame.joystick.init()
+
+    # Additional diagnostic info
+    print("\n=== Joystick Debug Info ===")
+    print("Pygame version:", pygame.version.ver)
+    print("SDL version:", pygame.version.SDL)
+    print("Joystick module initialized:", pygame.joystick.get_init())
+    print("SDL_JOYSTICK_HIDAPI:", os.environ.get('SDL_JOYSTICK_HIDAPI', 'not set'))
+    
+    # Try multiple event pumps with longer delays to ensure detection
+    # XInput devices sometimes need more time to enumerate
+    print("\nScanning for joysticks...")
+    for i in range(5):
+        pygame.event.pump()
+        time.sleep(0.2)  # Longer delay for XInput device enumeration
+        current_count = pygame.joystick.get_count()
+        if current_count > 0:
+            print(f"  Found {current_count} device(s) after {i+1} scan(s)")
+    
+    joystick_count = pygame.joystick.get_count()
+    print("Number of joysticks detected:", joystick_count)
+    
+    if joystick_count == 0:
+        print(":warning:  No joysticks detected by pygame.")
+        print("\nNote: If your device appears as 'Xbox peripheral' in Device Manager")
+        print("      but not in joy.cpl, it's using XInput (not DirectInput).")
+        print("      SDL2 should still detect it, but may need:")
+        print("      - Device to be connected before running this script")
+        print("      - Proper XInput drivers installed")
+        print("      - Device to be powered on and not in sleep mode")
+        print("\nTroubleshooting tips:")
+        print("  1. Ensure joystick/gamepad is physically connected and powered on")
+        print("  2. Check Windows Device Manager for the device (Xbox peripherals)")
+        print("  3. Try unplugging and replugging the device")
+        print("  4. Try a different USB port")
+        print("  5. Restart the script with device already connected")
+        print("  6. Check manufacturer's website for XInput-compatible drivers")
+        print("  7. Some wheels need to be in 'PC mode' not 'Xbox mode'")
+    else:
+        for i in range(joystick_count):
+            joy = pygame.joystick.Joystick(i)
+            joy.init()
+            print(f"\nJoystick {i}:")
+            print("  Name:", joy.get_name())
+            print("  GUID:", joy.get_guid() if hasattr(joy, "get_guid") else "N/A")
+            print("  ID:", joy.get_id() if hasattr(joy, "get_id") else "N/A")
+            print("  Num Axes:", joy.get_numaxes())
+            print("  Num Buttons:", joy.get_numbuttons())
+            print("  Num Hats:", joy.get_numhats())
+    print("===========================\n")
 
     wheel = None
 
