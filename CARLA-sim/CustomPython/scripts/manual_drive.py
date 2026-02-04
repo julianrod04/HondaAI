@@ -12,12 +12,12 @@ Controls:
     SPACE           - Hand brake
     ESC             - Quit
 
-Automatic Alert System:
-    The system automatically monitors driving behavior and displays alerts:
-    - Lane drifting (triggers "LANE CHANGE LEFT/RIGHT" to correct)
-    - Speeding (triggers "SLOW DOWN" when over limit)
-    - Too slow (triggers "SPEED UP" when moving too slowly)
-    - Following distance (triggers "SLOW DOWN" or "STOP" when too close to NPC)
+Automatic Instruction System:
+    The system automatically monitors driving behavior and displays instructions:
+    - Lane drifting (suggests merging back into proper lane position)
+    - Speeding (suggests reducing speed when over limit)
+    - Too slow (suggests increasing speed when moving too slowly)
+    - Following distance (suggests slowing down or stopping when too close to NPC)
 
 Also supports steering wheel/gamepad if connected.
 
@@ -47,116 +47,166 @@ from rl.config import DEFAULT_CONFIG
 
 
 # =============================================================================
-# ALERT SYSTEM
+# INSTRUCTION SYSTEM
 # =============================================================================
 
 class AlertType(Enum):
-    """Alert types for the autonomous vehicle."""
+    """Instruction types for the driving assistant."""
     NONE = 0
-    LANE_CHANGE_LEFT = 1
-    LANE_CHANGE_RIGHT = 2
+    # Lane drift warnings
+    DRIFTING_LEFT = 1
+    DRIFTING_RIGHT = 2
+    # Speed instructions
     STOP = 3
     SPEED_UP = 4
     SLOW_DOWN = 5
-    OVERTAKE = 6
-    EMERGENCY_STOP = 7
-    MAINTAIN = 8
+    # Navigation instructions
+    TURN_RIGHT = 6
+    TURN_LEFT = 7
+    STOP_AT_LIGHT = 8
+    # Other
+    EMERGENCY_STOP = 9
+    MAINTAIN = 10
 
 
-# Alert display configuration
+# Instruction display configuration
 ALERT_CONFIG = {
     AlertType.NONE: {
         "text": "",
         "color": (255, 255, 255),
         "bg_color": None,
         "icon": None,
+        "field_of_vision": False,
     },
-    AlertType.LANE_CHANGE_LEFT: {
-        "text": "← LANE CHANGE LEFT",
+    AlertType.DRIFTING_LEFT: {
+        "text": "Drifting into left lane",
         "color": (255, 255, 255),
-        "bg_color": (0, 120, 200),
+        "bg_color": (200, 150, 0),
         "icon": "←",
+        "field_of_vision": False,
     },
-    AlertType.LANE_CHANGE_RIGHT: {
-        "text": "LANE CHANGE RIGHT →",
+    AlertType.DRIFTING_RIGHT: {
+        "text": "Drifting into right lane",
         "color": (255, 255, 255),
-        "bg_color": (0, 120, 200),
+        "bg_color": (200, 150, 0),
         "icon": "→",
+        "field_of_vision": False,
     },
     AlertType.STOP: {
-        "text": "■ STOP",
+        "text": "Come to a complete stop",
         "color": (255, 255, 255),
         "bg_color": (200, 50, 50),
         "icon": "■",
+        "field_of_vision": False,
     },
     AlertType.SPEED_UP: {
-        "text": "↑ SPEED UP",
+        "text": "Increase your speed gradually",
         "color": (255, 255, 255),
         "bg_color": (50, 150, 50),
         "icon": "↑",
+        "field_of_vision": False,
     },
     AlertType.SLOW_DOWN: {
-        "text": "↓ SLOW DOWN",
+        "text": "Reduce your speed",
         "color": (255, 255, 255),
         "bg_color": (200, 150, 0),
         "icon": "↓",
+        "field_of_vision": False,
     },
-    AlertType.OVERTAKE: {
-        "text": "⇢ OVERTAKE",
+    AlertType.TURN_RIGHT: {
+        "text": "Turn Right",
         "color": (255, 255, 255),
-        "bg_color": (150, 50, 150),
-        "icon": "⇢",
+        "bg_color": (0, 120, 200),
+        "icon": "→",
+        "field_of_vision": True,
+    },
+    AlertType.TURN_LEFT: {
+        "text": "Turn Left",
+        "color": (255, 255, 255),
+        "bg_color": (0, 120, 200),
+        "icon": "←",
+        "field_of_vision": True,
+    },
+    AlertType.STOP_AT_LIGHT: {
+        "text": "Stop at the light",
+        "color": (255, 255, 255),
+        "bg_color": (200, 50, 50),
+        "icon": "●",
+        "field_of_vision": True,
     },
     AlertType.EMERGENCY_STOP: {
-        "text": "⚠ EMERGENCY STOP",
+        "text": "Stop immediately - Emergency",
         "color": (255, 255, 255),
         "bg_color": (255, 0, 0),
         "icon": "⚠",
+        "field_of_vision": True,
     },
     AlertType.MAINTAIN: {
-        "text": "● MAINTAIN",
+        "text": "Maintain your current speed",
         "color": (200, 200, 200),
         "bg_color": (80, 80, 80),
         "icon": "●",
+        "field_of_vision": False,
     },
 }
 
 
-class AlertDisplay:
+class Dashboard:
     """
-    Manages alert display with animations and timing.
+    Renders a car dashboard UI at the bottom of the screen.
+    Displays speed, instructions, lane position, and other driving info.
+    Also displays navigation instructions in the driver's field of vision.
     """
     
     def __init__(self, screen_width: int, screen_height: int):
         self.screen_width = screen_width
         self.screen_height = screen_height
         
+        # Dashboard dimensions
+        self.dashboard_height = 120
+        self.dashboard_y = screen_height - self.dashboard_height
+        
+        # Dashboard alert state (bottom right - drifting, speed, etc.)
         self.current_alert: AlertType = AlertType.NONE
         self.alert_start_time: float = 0.0
         self.alert_duration: float = 3.0  # seconds
         
+        # Navigation instruction state (field of vision - turn, stop at light, etc.)
+        self.current_nav: AlertType = AlertType.NONE
+        self.nav_start_time: float = 0.0
+        self.nav_duration: float = 5.0  # seconds - longer for navigation
+        
         # Fonts
         pygame.font.init()
-        self.font_large = pygame.font.SysFont("arial", 48, bold=True)
-        self.font_medium = pygame.font.SysFont("arial", 32)
-        self.font_small = pygame.font.SysFont("arial", 20)
+        self.font_speed = pygame.font.SysFont("arial", 42, bold=True)
+        self.font_speed_unit = pygame.font.SysFont("arial", 18)
+        self.font_instruction = pygame.font.SysFont("arial", 28, bold=True)
+        self.font_nav = pygame.font.SysFont("arial", 36, bold=True)  # Larger for field of vision
+        self.font_label = pygame.font.SysFont("arial", 14)
+        self.font_value = pygame.font.SysFont("arial", 18, bold=True)
         
         # Animation state
         self.fade_in_duration = 0.2
         self.fade_out_duration = 0.5
         
-        # Alert history for logging
+        # Instruction history for logging
         self.alert_history: list = []
         
-        # Cooldown to prevent alert spam
+        # Cooldown to prevent instruction spam
         self.last_alert_time: dict = {}
-        self.alert_cooldown: float = 2.0  # seconds between same alert type
+        self.alert_cooldown: float = 2.0  # seconds between same instruction type
+        
+        # Colors
+        self.bg_color = (20, 20, 25)  # Dark background
+        self.border_color = (60, 60, 70)
+        self.text_color = (220, 220, 220)
+        self.accent_color = (0, 150, 255)  # Blue accent
     
     def trigger_alert(self, alert_type: AlertType, duration: float = 3.0, force: bool = False) -> bool:
         """
-        Trigger a new alert.
+        Trigger a new instruction (dashboard or field of vision based on config).
         
-        Returns True if alert was triggered, False if on cooldown.
+        Returns True if instruction was triggered, False if on cooldown.
         """
         if alert_type == AlertType.NONE:
             self.clear_alert()
@@ -168,105 +218,309 @@ class AlertDisplay:
             if time.time() - last_time < self.alert_cooldown:
                 return False
         
-        self.current_alert = alert_type
-        self.alert_start_time = time.time()
-        self.alert_duration = duration
+        config = ALERT_CONFIG[alert_type]
+        
+        # Determine if this is a field of vision instruction or dashboard alert
+        if config.get("field_of_vision", False):
+            self.current_nav = alert_type
+            self.nav_start_time = time.time()
+            self.nav_duration = duration
+        else:
+            self.current_alert = alert_type
+            self.alert_start_time = time.time()
+            self.alert_duration = duration
+        
         self.last_alert_time[alert_type] = time.time()
         
-        # Log the alert
+        # Log the instruction
         self.alert_history.append({
             "type": alert_type.name,
             "time": time.time(),
         })
         
-        config = ALERT_CONFIG[alert_type]
-        print(f"[ALERT] {config['text']}")
+        print(f"[INSTRUCTION] {config['text']}")
         return True
     
+    def trigger_navigation(self, alert_type: AlertType, duration: float = 5.0) -> bool:
+        """Trigger a navigation instruction in the field of vision."""
+        return self.trigger_alert(alert_type, duration, force=True)
+    
     def clear_alert(self) -> None:
-        """Clear the current alert."""
+        """Clear the current dashboard alert."""
         self.current_alert = AlertType.NONE
     
+    def clear_navigation(self) -> None:
+        """Clear the current navigation instruction."""
+        self.current_nav = AlertType.NONE
+    
     def get_current_alert(self) -> AlertType:
-        """Get the current active alert."""
+        """Get the current active dashboard alert."""
         if self.current_alert == AlertType.NONE:
             return AlertType.NONE
         
-        # Check if alert has expired
+        # Check if instruction has expired
         elapsed = time.time() - self.alert_start_time
         if elapsed > self.alert_duration:
             self.current_alert = AlertType.NONE
         
         return self.current_alert
     
-    def render(self, screen: pygame.Surface) -> None:
-        """Render the alert on screen."""
-        alert = self.get_current_alert()
-        if alert == AlertType.NONE:
+    def get_current_navigation(self) -> AlertType:
+        """Get the current active navigation instruction."""
+        if self.current_nav == AlertType.NONE:
+            return AlertType.NONE
+        
+        # Check if instruction has expired
+        elapsed = time.time() - self.nav_start_time
+        if elapsed > self.nav_duration:
+            self.current_nav = AlertType.NONE
+        
+        return self.current_nav
+    
+    def render(self, screen: pygame.Surface, metrics: dict, reverse_mode: bool = False) -> None:
+        """Render the complete dashboard with all driving information."""
+        
+        # === FIELD OF VISION: Navigation Instructions (center-top) ===
+        self._render_field_of_vision(screen)
+        
+        # Draw dashboard background
+        dashboard_surface = pygame.Surface((self.screen_width, self.dashboard_height), pygame.SRCALPHA)
+        dashboard_surface.fill((*self.bg_color, 230))  # Semi-transparent dark background
+        
+        screen.blit(dashboard_surface, (0, self.dashboard_y))
+        
+        # === LEFT SECTION: Speed Gauge ===
+        self._render_speed_section(screen, metrics, reverse_mode)
+        
+        # === RIGHT SECTION: Lane, Distance & Instructions ===
+        self._render_info_section(screen, metrics)
+    
+    def _render_field_of_vision(self, screen: pygame.Surface) -> None:
+        """Render navigation instructions in the driver's field of vision (center of screen)."""
+        nav = self.get_current_navigation()
+        if nav == AlertType.NONE:
             return
         
-        config = ALERT_CONFIG[alert]
-        elapsed = time.time() - self.alert_start_time
+        config = ALERT_CONFIG[nav]
+        elapsed = time.time() - self.nav_start_time
         
         # Calculate alpha for fade effect
         if elapsed < self.fade_in_duration:
-            alpha = int(255 * (elapsed / self.fade_in_duration))
-        elif elapsed > self.alert_duration - self.fade_out_duration:
-            remaining = self.alert_duration - elapsed
-            alpha = int(255 * (remaining / self.fade_out_duration))
+            alpha = elapsed / self.fade_in_duration
+        elif elapsed > self.nav_duration - self.fade_out_duration:
+            remaining = self.nav_duration - elapsed
+            alpha = remaining / self.fade_out_duration
         else:
-            alpha = 255
+            alpha = 1.0
+        alpha = max(0.0, min(1.0, alpha))
         
-        alpha = max(0, min(255, alpha))
+        # Panel dimensions and position (center of screen - in driver's field of vision)
+        panel_width = 450
+        panel_height = 80
+        panel_x = (self.screen_width - panel_width) // 2
+        panel_y = (self.screen_height - self.dashboard_height) // 2 - panel_height // 2  # Center vertically above dashboard
         
-        # Create alert box
-        text = config["text"]
+        # Get colors
         bg_color = config["bg_color"]
         text_color = config["color"]
         
-        # Render text
-        text_surface = self.font_large.render(text, True, text_color)
-        text_rect = text_surface.get_rect()
+        # Create panel surface with full transparency support
+        panel_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
         
-        # Box dimensions
-        padding = 30
-        box_width = text_rect.width + padding * 2
-        box_height = text_rect.height + padding * 2
+        # Draw background with rounded corners effect
+        pygame.draw.rect(panel_surface, (*bg_color, int(220 * alpha)), 
+                        (0, 0, panel_width, panel_height), border_radius=15)
         
-        # Center position (top third of screen)
-        box_x = (self.screen_width - box_width) // 2
-        box_y = self.screen_height // 6
+        # Add white border
+        pygame.draw.rect(panel_surface, (255, 255, 255, int(255 * alpha)), 
+                       (0, 0, panel_width, panel_height), 4, border_radius=15)
         
-        # Draw semi-transparent background (more transparent)
-        if bg_color:
-            box_surface = pygame.Surface((box_width, box_height), pygame.SRCALPHA)
-            box_surface.fill((*bg_color, int(alpha * 0.45)))  # 45% opacity for background
+        screen.blit(panel_surface, (panel_x, panel_y))
+        
+        # Draw instruction text (render fresh each time for proper display)
+        display_text = config["text"]
+        if config.get("icon"):
+            display_text = f"{config['icon']}  {config['text']}"
+        
+        nav_text = self.font_nav.render(display_text, True, text_color)
+        nav_rect = nav_text.get_rect(center=(panel_x + panel_width // 2, panel_y + panel_height // 2))
+        
+        # Create a text surface with alpha
+        text_surface = pygame.Surface(nav_text.get_size(), pygame.SRCALPHA)
+        text_surface.blit(nav_text, (0, 0))
+        text_surface.set_alpha(int(255 * alpha))
+        
+        screen.blit(text_surface, nav_rect)
+    
+    def _render_speed_section(self, screen: pygame.Surface, metrics: dict, reverse_mode: bool) -> None:
+        """Render the speed display on the left side of the dashboard."""
+        speed_kmh = metrics.get("speed_kmh", 0)
+        
+        # Speed section position
+        section_x = 40
+        section_center_y = self.dashboard_y + self.dashboard_height // 2
+        
+        # Speed color based on value
+        if speed_kmh > 80:
+            speed_color = (255, 80, 80)  # Red - way too fast
+        elif speed_kmh > 50:
+            speed_color = (255, 200, 0)  # Yellow - over limit
+        else:
+            speed_color = (255, 255, 255)  # White - normal
+        
+        # Draw speed value
+        speed_text = self.font_speed.render(f"{speed_kmh:.0f}", True, speed_color)
+        speed_rect = speed_text.get_rect(midleft=(section_x, section_center_y - 5))
+        screen.blit(speed_text, speed_rect)
+        
+        # Draw unit label
+        unit_text = self.font_speed_unit.render("km/h", True, (150, 150, 150))
+        unit_rect = unit_text.get_rect(midleft=(speed_rect.right + 5, section_center_y + 10))
+        screen.blit(unit_text, unit_rect)
+        
+        # Draw reverse indicator if active
+        if reverse_mode:
+            rev_text = self.font_label.render("R", True, (255, 100, 100))
+            rev_rect = rev_text.get_rect(midleft=(section_x, section_center_y + 35))
+            # Draw background circle
+            pygame.draw.circle(screen, (80, 30, 30), rev_rect.center, 12)
+            screen.blit(rev_text, rev_rect)
+    
+    def _render_info_section(self, screen: pygame.Surface, metrics: dict) -> None:
+        """Render lane position, distance info, and instructions on the right side of the dashboard."""
+        section_x = self.screen_width - 200
+        section_y = self.dashboard_y + 15
+        
+        # === Lane Position ===
+        lane_offset = metrics.get("lane_offset", 0)
+        lane_status = metrics.get("lane_status", "OK")
+        
+        # Lane label
+        lane_label = self.font_label.render("LANE POSITION", True, (120, 120, 120))
+        screen.blit(lane_label, (section_x, section_y))
+        
+        # Lane offset bar
+        bar_width = 140
+        bar_height = 12
+        bar_x = section_x
+        bar_y = section_y + 20
+        
+        # Background bar
+        pygame.draw.rect(screen, (50, 50, 55), (bar_x, bar_y, bar_width, bar_height), border_radius=6)
+        
+        # Center marker
+        pygame.draw.line(screen, (100, 100, 100), 
+                        (bar_x + bar_width // 2, bar_y - 2),
+                        (bar_x + bar_width // 2, bar_y + bar_height + 2), 2)
+        
+        # Position indicator
+        if lane_status == "CRITICAL":
+            indicator_color = (255, 80, 80)
+        elif lane_status == "WARNING":
+            indicator_color = (255, 200, 0)
+        else:
+            indicator_color = (80, 200, 80)
+        
+        # Clamp indicator position
+        indicator_offset = int(lane_offset * 35)
+        indicator_x = bar_x + bar_width // 2 + indicator_offset
+        indicator_x = max(bar_x + 8, min(bar_x + bar_width - 8, indicator_x))
+        
+        pygame.draw.circle(screen, indicator_color, (indicator_x, bar_y + bar_height // 2), 7)
+        pygame.draw.circle(screen, (255, 255, 255), (indicator_x, bar_y + bar_height // 2), 7, 2)
+        
+        # Lane offset value
+        offset_text = self.font_value.render(f"{lane_offset:+.1f}m", True, indicator_color)
+        screen.blit(offset_text, (bar_x + bar_width + 10, bar_y - 2))
+        
+        # === Distance to Vehicle Ahead ===
+        if "distance_to_npc" in metrics:
+            dist = metrics["distance_to_npc"]
+            follow_status = metrics.get("follow_status", "N/A")
             
-            # Add subtle border
-            pygame.draw.rect(box_surface, (255, 255, 255, int(alpha * 0.6)), 
-                           (0, 0, box_width, box_height), 2, border_radius=10)
+            dist_y = section_y + 45
             
-            screen.blit(box_surface, (box_x, box_y))
+            # Distance label
+            dist_label = self.font_label.render("VEHICLE AHEAD", True, (120, 120, 120))
+            screen.blit(dist_label, (section_x, dist_y))
+            
+            # Distance color
+            if follow_status == "CRITICAL":
+                dist_color = (255, 80, 80)
+            elif follow_status == "WARNING":
+                dist_color = (255, 200, 0)
+            else:
+                dist_color = (150, 150, 150)
+            
+            # Distance value
+            dist_text = self.font_value.render(f"{dist:.1f} m", True, dist_color)
+            screen.blit(dist_text, (section_x, dist_y + 18))
+            
+            # Simple distance bar
+            max_dist = 30.0
+            dist_bar_width = int((min(dist, max_dist) / max_dist) * 100)
+            pygame.draw.rect(screen, (50, 50, 55), (section_x + 70, dist_y + 20, 100, 8), border_radius=4)
+            if dist_bar_width > 0:
+                pygame.draw.rect(screen, dist_color, (section_x + 70, dist_y + 20, dist_bar_width, 8), border_radius=4)
         
-        # Draw text with alpha (slightly transparent)
-        text_surface.set_alpha(int(alpha * 0.85))
-        text_x = box_x + padding
-        text_y = box_y + padding
-        screen.blit(text_surface, (text_x, text_y))
-        
-        # Draw subtle pulsing effect for urgent alerts
-        if alert in (AlertType.STOP, AlertType.EMERGENCY_STOP):
-            pulse = abs(math.sin(elapsed * 4)) * 0.2 + 0.3  # More subtle pulse
-            border_alpha = int(alpha * pulse)
-            border_surface = pygame.Surface((box_width + 10, box_height + 10), pygame.SRCALPHA)
-            pygame.draw.rect(border_surface, (255, 100, 100, border_alpha),
-                           (0, 0, box_width + 10, box_height + 10), 3, border_radius=12)
-            screen.blit(border_surface, (box_x - 5, box_y - 5))
+        # === Instructions (bottom right) ===
+        alert = self.get_current_alert()
+        if alert != AlertType.NONE:
+            config = ALERT_CONFIG[alert]
+            elapsed = time.time() - self.alert_start_time
+            
+            # Calculate alpha for fade effect
+            if elapsed < self.fade_in_duration:
+                alpha = elapsed / self.fade_in_duration
+            elif elapsed > self.alert_duration - self.fade_out_duration:
+                remaining = self.alert_duration - elapsed
+                alpha = remaining / self.fade_out_duration
+            else:
+                alpha = 1.0
+            alpha = max(0.0, min(1.0, alpha))
+            
+            # Instruction panel position (bottom right, above dashboard)
+            panel_width = 350
+            panel_height = 50
+            panel_x = self.screen_width - panel_width - 20
+            panel_y = self.dashboard_y - panel_height - 10
+            
+            # Get colors
+            bg_color = config["bg_color"]
+            text_color = config["color"]
+            
+            # Draw instruction panel with colored background
+            panel_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+            panel_surface.fill((*bg_color, int(200 * alpha)))
+            
+            # Add border
+            pygame.draw.rect(panel_surface, (255, 255, 255, int(150 * alpha)), 
+                           (0, 0, panel_width, panel_height), 2, border_radius=8)
+            
+            screen.blit(panel_surface, (panel_x, panel_y))
+            
+            # Draw instruction text
+            instruction_text = self.font_instruction.render(config["text"], True, text_color)
+            instruction_text.set_alpha(int(255 * alpha))
+            instruction_rect = instruction_text.get_rect(center=(panel_x + panel_width // 2, panel_y + panel_height // 2))
+            screen.blit(instruction_text, instruction_rect)
+            
+            # Pulsing border for urgent instructions
+            if alert in (AlertType.STOP, AlertType.EMERGENCY_STOP):
+                pulse = abs(math.sin(elapsed * 5)) * 0.5 + 0.5
+                pulse_surface = pygame.Surface((panel_width + 6, panel_height + 6), pygame.SRCALPHA)
+                pygame.draw.rect(pulse_surface, (255, 80, 80, int(150 * pulse * alpha)),
+                               (0, 0, panel_width + 6, panel_height + 6), 3, border_radius=10)
+                screen.blit(pulse_surface, (panel_x - 3, panel_y - 3))
+
+
+# Keep AlertDisplay as an alias for backwards compatibility
+AlertDisplay = Dashboard
 
 
 class DrivingMonitor:
     """
-    Monitors driving behavior and automatically triggers alerts.
+    Monitors driving behavior and automatically provides driving instructions.
     
     Detects:
     - Lane drifting
@@ -348,7 +602,7 @@ class DrivingMonitor:
         alert_display: AlertDisplay
     ) -> dict:
         """
-        Update monitoring and trigger alerts as needed.
+        Update monitoring and trigger instructions as needed.
         
         Returns dict with current driving metrics.
         """
@@ -375,13 +629,13 @@ class DrivingMonitor:
         # === LANE DRIFT DETECTION ===
         abs_offset = abs(avg_offset)
         if abs_offset > self.lane_drift_critical:
-            # Critical lane drift - suggest correction
+            # Critical lane drift - show drifting warning
             if avg_offset > 0:
-                # Drifting right, suggest go left
-                alert_display.trigger_alert(AlertType.LANE_CHANGE_LEFT, duration=2.0)
+                # Drifting right
+                alert_display.trigger_alert(AlertType.DRIFTING_RIGHT, duration=2.0)
             else:
-                # Drifting left, suggest go right
-                alert_display.trigger_alert(AlertType.LANE_CHANGE_RIGHT, duration=2.0)
+                # Drifting left
+                alert_display.trigger_alert(AlertType.DRIFTING_LEFT, duration=2.0)
             metrics["lane_status"] = "CRITICAL"
         elif abs_offset > self.lane_drift_warning:
             metrics["lane_status"] = "WARNING"
@@ -406,7 +660,6 @@ class DrivingMonitor:
             
             if self.is_vehicle_ahead(ego, npc):
                 if distance < self.follow_distance_critical:
-                    alert_display.trigger_alert(AlertType.STOP, duration=2.0)
                     metrics["follow_status"] = "CRITICAL"
                 elif distance < self.follow_distance_warning:
                     alert_display.trigger_alert(AlertType.SLOW_DOWN, duration=2.0)
@@ -642,22 +895,18 @@ def main():
     screen = pygame.display.set_mode((W, H))
     pygame.display.set_caption("CARLA Manual Drive - WASD to drive, R=reverse, ESC=quit")
     
-    pygame.font.init()
-    font = pygame.font.SysFont("consolas", 28)
-    small_font = pygame.font.SysFont("consolas", 20)
-    
     clock = pygame.time.Clock()
     control = carla.VehicleControl()
     reverse_mode = False
     running = True
     
-    # Create alert display and driving monitor
+    # Create instruction display and driving monitor
     alert_display = AlertDisplay(W, H)
     world_map = world.get_map()
     driving_monitor = DrivingMonitor(world_map, config)
     
     print("\n" + "=" * 50)
-    print("MANUAL DRIVE WITH ALERT SYSTEM")
+    print("MANUAL DRIVE WITH INSTRUCTION SYSTEM")
     print("=" * 50)
     print("Driving Controls:")
     print("  W/Up     - Accelerate")
@@ -667,10 +916,15 @@ def main():
     print("  SPACE    - Hand brake")
     print("  ESC      - Quit")
     print("")
+    print("Navigation Instructions (test keys):")
+    print("  1        - Turn Left")
+    print("  2        - Turn Right")
+    print("  3        - Stop at the light")
+    print("")
     print("Automatic Alerts:")
-    print("  - Lane drift warning")
-    print("  - Speed monitoring")
-    print("  - Following distance")
+    print("  - Lane drifting warnings")
+    print("  - Speed recommendations")
+    print("  - Following distance advice")
     print("=" * 50 + "\n")
     
     try:
@@ -687,6 +941,13 @@ def main():
                     elif event.key == pygame.K_r:
                         reverse_mode = not reverse_mode
                         print(f"Reverse: {'ON' if reverse_mode else 'OFF'}")
+                    # Navigation instruction test keys
+                    elif event.key == pygame.K_1:
+                        alert_display.trigger_navigation(AlertType.TURN_LEFT, duration=5.0)
+                    elif event.key == pygame.K_2:
+                        alert_display.trigger_navigation(AlertType.TURN_RIGHT, duration=5.0)
+                    elif event.key == pygame.K_3:
+                        alert_display.trigger_navigation(AlertType.STOP_AT_LIGHT, duration=5.0)
                 
                 elif event.type == pygame.JOYBUTTONDOWN:
                     # Button 4 or 5 for reverse on most controllers
@@ -703,86 +964,16 @@ def main():
             # Apply control
             ego.apply_control(control)
             
-            # Update driving monitor (automatic alerts)
+            # Update driving monitor (automatic instructions)
             metrics = driving_monitor.update(ego, npc, alert_display)
-            
-            # Get speed and position from metrics
-            speed_kmh = metrics.get("speed_kmh", 0)
-            lane_offset = metrics.get("lane_offset", 0)
-            
-            # Get position
-            ego_loc = ego.get_location()
-            progress = (ego_loc.x - config.scenario.spawn_x) / (config.scenario.goal_x - config.scenario.spawn_x)
             
             # Draw camera view
             if latest_image is not None:
                 surf = pygame.surfarray.make_surface(latest_image.swapaxes(0, 1))
                 screen.blit(surf, (0, 0))
             
-            # Draw HUD
-            # Speed
-            speed_color = (255, 255, 255) if speed_kmh < 50 else (255, 200, 0) if speed_kmh < 80 else (255, 100, 100)
-            speed_text = font.render(f"{speed_kmh:5.1f} km/h", True, speed_color)
-            screen.blit(speed_text, (20, 20))
-            
-            # Reverse indicator
-            if reverse_mode:
-                rev_text = font.render("REVERSE", True, (255, 100, 100))
-                screen.blit(rev_text, (20, 55))
-            
-            # Lane offset indicator (right side of screen)
-            lane_status = metrics.get("lane_status", "OK")
-            if lane_status == "CRITICAL":
-                lane_color = (255, 100, 100)
-            elif lane_status == "WARNING":
-                lane_color = (255, 200, 0)
-            else:
-                lane_color = (100, 255, 100)
-            
-            lane_text = small_font.render(f"Lane: {lane_offset:+.2f}m", True, lane_color)
-            screen.blit(lane_text, (W - 150, 20))
-            
-            # Visual lane offset bar
-            bar_width = 120
-            bar_height = 10
-            bar_x = W - 150
-            bar_y = 45
-            
-            # Background bar
-            pygame.draw.rect(screen, (60, 60, 60), (bar_x, bar_y, bar_width, bar_height))
-            
-            # Center line
-            pygame.draw.line(screen, (255, 255, 255), 
-                           (bar_x + bar_width // 2, bar_y - 2),
-                           (bar_x + bar_width // 2, bar_y + bar_height + 2), 2)
-            
-            # Position indicator (clamp to bar width)
-            indicator_pos = bar_x + bar_width // 2 + int(lane_offset * 30)
-            indicator_pos = max(bar_x + 5, min(bar_x + bar_width - 5, indicator_pos))
-            pygame.draw.circle(screen, lane_color, (indicator_pos, bar_y + bar_height // 2), 6)
-            
-            # Distance to NPC (if available)
-            if "distance_to_npc" in metrics:
-                dist = metrics["distance_to_npc"]
-                follow_status = metrics.get("follow_status", "N/A")
-                if follow_status == "CRITICAL":
-                    dist_color = (255, 100, 100)
-                elif follow_status == "WARNING":
-                    dist_color = (255, 200, 0)
-                else:
-                    dist_color = (200, 200, 200)
-                dist_text = small_font.render(f"NPC: {dist:.1f}m", True, dist_color)
-                screen.blit(dist_text, (W - 150, 65))
-            
-            # Position and progress
-            pos_text = small_font.render(f"X: {ego_loc.x:.1f}  Y: {ego_loc.y:.1f}", True, (200, 200, 200))
-            screen.blit(pos_text, (20, H - 60))
-            
-            progress_text = small_font.render(f"Progress: {progress*100:.1f}%", True, (200, 200, 200))
-            screen.blit(progress_text, (20, H - 35))
-            
-            # Render alert system
-            alert_display.render(screen)
+            # Render the dashboard with all driving info and instructions
+            alert_display.render(screen, metrics, reverse_mode)
             
             pygame.display.flip()
     
