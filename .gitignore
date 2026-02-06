@@ -146,7 +146,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-.carla.venv
 
 # Spyder project settings
 .spyderproject
