@@ -689,17 +689,26 @@ class DrivingMonitor:
 class TopDownSpectator:
     """
     Background daemon thread that positions the CARLA spectator camera
-    directly above the ego vehicle for a bird's-eye view.
+    directly above the ego vehicle for a smooth bird's-eye view.
 
-    Finds the ego vehicle by role_name='hero' and updates the spectator
-    at 20 FPS with pitch=-90 (straight down).
+    Accepts the ego vehicle directly (no per-frame actor queries).
+    Uses exponential smoothing for fluid camera motion and supports
+    thread-safe scroll-wheel zoom via adjust_height().
     """
 
-    def __init__(self, world: carla.World, height: float = 40.0):
+    MIN_HEIGHT = 15.0
+    MAX_HEIGHT = 120.0
+
+    def __init__(self, world: carla.World, ego: carla.Vehicle, height: float = 40.0):
         self.world = world
-        self.height = height
+        self.ego = ego
+        self.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, height))
+        self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Smoothed position (initialised on first tick)
+        self._smooth_x: Optional[float] = None
+        self._smooth_y: Optional[float] = None
 
     def start(self) -> None:
         """Start the spectator tracking thread."""
@@ -708,7 +717,7 @@ class TopDownSpectator:
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        print(f"[Spectator] Top-down view started (height={self.height}m)")
+        print(f"[Spectator] Top-down view started (height={self.height}m, scroll to zoom)")
 
     def stop(self) -> None:
         """Stop the spectator tracking thread."""
@@ -718,34 +727,39 @@ class TopDownSpectator:
             self._thread = None
             print("[Spectator] Stopped")
 
+    def adjust_height(self, delta: float) -> None:
+        """Thread-safe zoom: negative delta = zoom in, positive = zoom out."""
+        with self._lock:
+            self.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, self.height + delta))
+
     def _loop(self) -> None:
-        """Main loop: find hero vehicle and position spectator above it."""
+        """Main loop: smooth-track the ego vehicle from above."""
         spectator = self.world.get_spectator()
+        alpha = 0.15  # exponential smoothing factor
 
         while self._running:
-            # Find the ego vehicle
-            ego = None
-            for actor in self.world.get_actors().filter('vehicle.*'):
-                if actor.attributes.get('role_name') == 'hero':
-                    ego = actor
-                    break
+            ego_loc = self.ego.get_location()
 
-            if ego is None:
-                time.sleep(0.5)
-                continue
+            # Initialise smoothed position on first frame
+            if self._smooth_x is None:
+                self._smooth_x = ego_loc.x
+                self._smooth_y = ego_loc.y
+            else:
+                self._smooth_x += alpha * (ego_loc.x - self._smooth_x)
+                self._smooth_y += alpha * (ego_loc.y - self._smooth_y)
 
-            ego_loc = ego.get_location()
+            with self._lock:
+                h = self.height
 
-            # Position spectator directly above, looking straight down
             cam_loc = carla.Location(
-                x=ego_loc.x,
-                y=ego_loc.y,
-                z=ego_loc.z + self.height
+                x=self._smooth_x,
+                y=self._smooth_y,
+                z=ego_loc.z + h,
             )
             cam_rot = carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
             spectator.set_transform(carla.Transform(cam_loc, cam_rot))
 
-            time.sleep(0.05)  # 20 FPS
+            time.sleep(0.025)  # ~40 FPS
 
 
 # =============================================================================
@@ -925,10 +939,10 @@ def get_wheel_control(
     num_axes = wheel.get_numaxes()
 
     if num_axes >= 4:
-        # Likely a wheel with separate pedals
-        # Axis 2 or 3 for throttle, Axis 1 or 2 for brake
-        accel_axis = wheel.get_axis(2)
-        brake_axis = wheel.get_axis(3)
+        # G920 wheel with separate pedals
+        # Axis 3 = accelerator, Axis 1 = brake (Axis 2 = clutch, ignored)
+        accel_axis = wheel.get_axis(3)
+        brake_axis = wheel.get_axis(1)
     elif num_axes >= 2:
         # Gamepad - use triggers or second stick
         accel_axis = wheel.get_axis(1)
@@ -1106,7 +1120,7 @@ def run_manual_drive(
     # Optionally start top-down spectator
     spectator = None
     if enable_spectator:
-        spectator = TopDownSpectator(world, height=spectator_height)
+        spectator = TopDownSpectator(world, ego=ego, height=spectator_height)
         spectator.start()
 
     print("\n" + "=" * 50)
@@ -1173,11 +1187,17 @@ def run_manual_drive(
                         reverse_mode = not reverse_mode
                         print(f"Reverse: {'ON' if reverse_mode else 'OFF'}")
 
-            # Get control input
-            keys = pygame.key.get_pressed()
+                elif event.type == pygame.MOUSEWHEEL and spectator is not None:
+                    # Scroll up = zoom in (decrease height), scroll down = zoom out
+                    spectator.adjust_height(-3.0 * event.y)
+
+            # Get control input — wheel and keyboard are mutually exclusive
+            # so keyboard "coast" logic doesn't overwrite wheel every frame
             if wheel:
                 control = get_wheel_control(wheel, control, reverse_mode)
-            control = get_keyboard_control(keys, control, reverse_mode)
+            else:
+                keys = pygame.key.get_pressed()
+                control = get_keyboard_control(keys, control, reverse_mode)
 
             # Apply control
             ego.apply_control(control)
@@ -1227,7 +1247,14 @@ def main():
     parser.add_argument("--height", type=int, default=720, help="Window height")
     parser.add_argument("--spectator", action="store_true", help="Enable top-down spectator view")
     parser.add_argument("--spectator-height", type=float, default=40.0, help="Spectator camera height in meters")
+    parser.add_argument("--diag", action="store_true", help="Run steering wheel axis diagnostic (no CARLA needed)")
     args = parser.parse_args()
+
+    # Axis diagnostic mode — no CARLA connection required
+    if args.diag:
+        from kw_sandbox.steering_control import run_axis_diagnostic
+        run_axis_diagnostic()
+        return
 
     config = DEFAULT_CONFIG
 
