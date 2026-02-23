@@ -6,6 +6,8 @@ managing actors (vehicles, sensors).
 """
 
 import math
+import platform
+import subprocess
 import time
 from typing import Optional, Tuple, List
 
@@ -410,6 +412,23 @@ def teleport_vehicle(
     if zero_velocity:
         vehicle.set_target_velocity(carla.Vector3D(0, 0, 0))
         vehicle.set_target_angular_velocity(carla.Vector3D(0, 0, 0))
+
+
+def kill_all_carla_processes() -> None:
+    """
+    Force-kill all CarlaUE4 server processes on this machine.
+
+    On Linux, CarlaUE4.sh spawns a child binary (CarlaUE4-Linux-Shipping)
+    that survives a SIGTERM to the shell script's process group.
+    pkill -9 -f CarlaUE4 catches both the wrapper and the binary.
+    """
+    print("[Cleanup] Killing all CARLA server processes...")
+    if platform.system() == "Windows":
+        for name in ("CarlaUE4.exe", "CarlaUE4-Win64-Shipping.exe"):
+            subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True)
+    else:
+        subprocess.run(["pkill", "-9", "-f", "CarlaUE4"], capture_output=True)
+    print("[Cleanup] Done.")
 
 
 def wait_for_tick(world: carla.World, timeout: float = 10.0) -> bool:

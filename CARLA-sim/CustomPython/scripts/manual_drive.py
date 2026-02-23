@@ -52,8 +52,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import carla
 
-from rl.config import DEFAULT_CONFIG, ScenarioConfig
-from rl.utils import teleport_vehicle, create_spawn_transform
+from rl.config import DEFAULT_CONFIG, AlertDisplayConfig, ScenarioConfig
+from rl.utils import kill_all_carla_processes, teleport_vehicle, create_spawn_transform
 
 
 # =============================================================================
@@ -77,6 +77,13 @@ class AlertType(Enum):
     # Other
     EMERGENCY_STOP = 9
     MAINTAIN = 10
+    # New alert types
+    SPEEDING = 11                   # speed exceeds speed limit
+    SPEEDUP_FROM_STANDSTILL = 12    # accelerating from near-zero
+    FRONT_PROXIMITY_WARNING = 13    # vehicle ahead 5-10m
+    FRONT_PROXIMITY_CRITICAL = 14   # vehicle ahead < 5m
+    REAR_PROXIMITY_WARNING = 15     # vehicle behind 5-10m
+    REAR_PROXIMITY_CRITICAL = 16    # vehicle behind < 5m
 
 
 # Instruction display configuration
@@ -158,6 +165,48 @@ ALERT_CONFIG = {
         "icon": "\u25cf",
         "field_of_vision": False,
     },
+    AlertType.SPEEDING: {
+        "text": "Speed limit exceeded",
+        "color": (255, 255, 255),
+        "bg_color": (200, 80, 0),
+        "icon": "\u26a0",
+        "field_of_vision": False,
+    },
+    AlertType.SPEEDUP_FROM_STANDSTILL: {
+        "text": "Accelerating from standstill",
+        "color": (255, 255, 255),
+        "bg_color": (50, 150, 50),
+        "icon": "\u21d1",
+        "field_of_vision": False,
+    },
+    AlertType.FRONT_PROXIMITY_WARNING: {
+        "text": "Vehicle ahead - slow down",
+        "color": (255, 255, 255),
+        "bg_color": (200, 150, 0),
+        "icon": "\u26a0",
+        "field_of_vision": False,
+    },
+    AlertType.FRONT_PROXIMITY_CRITICAL: {
+        "text": "Too close! Brake now",
+        "color": (255, 255, 255),
+        "bg_color": (200, 30, 30),
+        "icon": "\u26d4",
+        "field_of_vision": True,
+    },
+    AlertType.REAR_PROXIMITY_WARNING: {
+        "text": "Vehicle approaching from behind",
+        "color": (255, 255, 255),
+        "bg_color": (200, 150, 0),
+        "icon": "\u2193",
+        "field_of_vision": False,
+    },
+    AlertType.REAR_PROXIMITY_CRITICAL: {
+        "text": "Vehicle very close behind!",
+        "color": (255, 255, 255),
+        "bg_color": (200, 30, 30),
+        "icon": "\u26a0",
+        "field_of_vision": False,
+    },
 }
 
 
@@ -168,12 +217,19 @@ class Dashboard:
     Also displays navigation instructions in the driver's field of vision.
     """
 
-    def __init__(self, screen_width: int, screen_height: int):
+    def __init__(
+        self,
+        screen_width: int,
+        screen_height: int,
+        dashboard_height: int = 120,
+        alert_config: AlertDisplayConfig = None,
+    ):
         self.screen_width = screen_width
         self.screen_height = screen_height
+        self.alert_config = alert_config if alert_config is not None else AlertDisplayConfig()
 
         # Dashboard dimensions
-        self.dashboard_height = 120
+        self.dashboard_height = dashboard_height
         self.dashboard_y = screen_height - self.dashboard_height
 
         # Dashboard alert state (bottom right - drifting, speed, etc.)
@@ -293,17 +349,47 @@ class Dashboard:
         # === FIELD OF VISION: Navigation Instructions (center-top) ===
         self._render_field_of_vision(screen)
 
-        # Draw dashboard background
-        dashboard_surface = pygame.Surface((self.screen_width, self.dashboard_height), pygame.SRCALPHA)
-        dashboard_surface.fill((*self.bg_color, 230))  # Semi-transparent dark background
+        if self.alert_config.show_diagnostics_bar:
+            # Draw dashboard background
+            dashboard_surface = pygame.Surface((self.screen_width, self.dashboard_height), pygame.SRCALPHA)
+            dashboard_surface.fill((*self.bg_color, 230))  # Semi-transparent dark background
 
-        screen.blit(dashboard_surface, (0, self.dashboard_y))
+            screen.blit(dashboard_surface, (0, self.dashboard_y))
 
-        # === LEFT SECTION: Speed Gauge ===
-        self._render_speed_section(screen, metrics, reverse_mode)
+            # === LEFT SECTION: Speed Gauge ===
+            self._render_speed_section(screen, metrics, reverse_mode)
 
-        # === RIGHT SECTION: Lane, Distance & Instructions ===
-        self._render_info_section(screen, metrics)
+            # === RIGHT SECTION: Lane, Distance & Instructions ===
+            self._render_info_section(screen, metrics)
+
+    def _resolve_dashboard_alert_xy(self, w: int, h: int) -> tuple:
+        """Compute (x, y) for the dashboard alert panel (above the HUD bar)."""
+        sw = self.screen_width
+        by = self.dashboard_y - h - 10  # just above the dashboard strip
+        positions = {
+            "bottom-left":   (20, by),
+            "bottom-center": ((sw - w) // 2, by),
+            "bottom-right":  (sw - w - 20, by),
+        }
+        return positions.get(self.alert_config.dashboard_position, positions["bottom-right"])
+
+    def _resolve_panel_xy(self, w: int, h: int) -> tuple:
+        """Compute (x, y) panel position from alert_config.position or custom override."""
+        if self.alert_config.custom_x is not None:
+            return self.alert_config.custom_x, self.alert_config.custom_y
+
+        sw = self.screen_width
+        cam_h = self.screen_height - self.dashboard_height  # viewport above dashboard
+
+        positions = {
+            "center":       ((sw - w) // 2, (cam_h - h) // 2),
+            "top-center":   ((sw - w) // 2, 20),
+            "top-left":     (20, 20),
+            "top-right":    (sw - w - 20, 20),
+            "bottom-left":  (20, cam_h - h - 20),
+            "bottom-right": (sw - w - 20, cam_h - h - 20),
+        }
+        return positions.get(self.alert_config.position, positions["center"])
 
     def _render_field_of_vision(self, screen: pygame.Surface) -> None:
         """Render navigation instructions in the driver's field of vision (center of screen)."""
@@ -311,7 +397,7 @@ class Dashboard:
         if nav == AlertType.NONE:
             return
 
-        config = ALERT_CONFIG[nav]
+        alert_cfg = ALERT_CONFIG[nav]
         elapsed = time.time() - self.nav_start_time
 
         # Calculate alpha for fade effect
@@ -324,21 +410,23 @@ class Dashboard:
             alpha = 1.0
         alpha = max(0.0, min(1.0, alpha))
 
-        # Panel dimensions and position (center of screen - in driver's field of vision)
-        panel_width = 450
-        panel_height = 80
-        panel_x = (self.screen_width - panel_width) // 2
-        panel_y = (self.screen_height - self.dashboard_height) // 2 - panel_height // 2  # Center vertically above dashboard
+        # Panel dimensions from config
+        panel_width = self.alert_config.width
+        panel_height = self.alert_config.height
+        panel_x, panel_y = self._resolve_panel_xy(panel_width, panel_height)
 
-        # Get colors
-        bg_color = config["bg_color"]
-        text_color = config["color"]
+        # Get colors — override or per-alert
+        bg_color = self.alert_config.bg_color_override or alert_cfg["bg_color"]
+        text_color = self.alert_config.text_color
+
+        # Base alpha from config (0-255) scaled by fade factor
+        base_alpha = self.alert_config.alpha
 
         # Create panel surface with full transparency support
         panel_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
 
         # Draw background with rounded corners effect
-        pygame.draw.rect(panel_surface, (*bg_color, int(220 * alpha)),
+        pygame.draw.rect(panel_surface, (*bg_color, int(base_alpha * alpha)),
                         (0, 0, panel_width, panel_height), border_radius=15)
 
         # Add white border
@@ -348,9 +436,9 @@ class Dashboard:
         screen.blit(panel_surface, (panel_x, panel_y))
 
         # Draw instruction text (render fresh each time for proper display)
-        display_text = config["text"]
-        if config.get("icon"):
-            display_text = f"{config['icon']}  {config['text']}"
+        display_text = alert_cfg["text"]
+        if alert_cfg.get("icon"):
+            display_text = f"{alert_cfg['icon']}  {alert_cfg['text']}"
 
         nav_text = self.font_nav.render(display_text, True, text_color)
         nav_rect = nav_text.get_rect(center=(panel_x + panel_width // 2, panel_y + panel_height // 2))
@@ -473,54 +561,60 @@ class Dashboard:
             if dist_bar_width > 0:
                 pygame.draw.rect(screen, dist_color, (section_x + 70, dist_y + 20, dist_bar_width, 8), border_radius=4)
 
-        # === Instructions (bottom right) ===
+        # === Dashboard alert panel ===
         alert = self.get_current_alert()
         if alert != AlertType.NONE:
-            config = ALERT_CONFIG[alert]
+            alert_cfg = ALERT_CONFIG[alert]
             elapsed = time.time() - self.alert_start_time
 
-            # Calculate alpha for fade effect
+            # Fade in/out
             if elapsed < self.fade_in_duration:
-                alpha = elapsed / self.fade_in_duration
+                fade = elapsed / self.fade_in_duration
             elif elapsed > self.alert_duration - self.fade_out_duration:
-                remaining = self.alert_duration - elapsed
-                alpha = remaining / self.fade_out_duration
+                fade = (self.alert_duration - elapsed) / self.fade_out_duration
             else:
-                alpha = 1.0
-            alpha = max(0.0, min(1.0, alpha))
+                fade = 1.0
+            fade = max(0.0, min(1.0, fade))
 
-            # Instruction panel position (bottom right, above dashboard)
-            panel_width = 350
-            panel_height = 50
-            panel_x = self.screen_width - panel_width - 20
-            panel_y = self.dashboard_y - panel_height - 10
+            # Resolve colors — config overrides take priority over per-alert defaults
+            bg_color = self.alert_config.dashboard_bg_color_override or alert_cfg["bg_color"]
+            text_color = self.alert_config.dashboard_text_color or alert_cfg["color"]
 
-            # Get colors
-            bg_color = config["bg_color"]
-            text_color = config["color"]
+            # Build display text (icon + label)
+            display_text = alert_cfg["text"]
+            if alert_cfg.get("icon"):
+                display_text = f"{alert_cfg['icon']}  {alert_cfg['text']}"
 
-            # Draw instruction panel with colored background
+            # Auto-size panel to fit text + padding
+            text_surf = self.font_instruction.render(display_text, True, text_color)
+            tw, th = text_surf.get_size()
+            px = self.alert_config.dashboard_padding_x
+            py = self.alert_config.dashboard_padding_y
+            panel_width = tw + px * 2
+            panel_height = th + py * 2
+
+            panel_x, panel_y = self._resolve_dashboard_alert_xy(panel_width, panel_height)
+
+            base_alpha = self.alert_config.dashboard_alpha
+
+            # Draw panel background
             panel_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
-            panel_surface.fill((*bg_color, int(200 * alpha)))
-
-            # Add border
-            pygame.draw.rect(panel_surface, (255, 255, 255, int(150 * alpha)),
-                           (0, 0, panel_width, panel_height), 2, border_radius=8)
-
+            panel_surface.fill((*bg_color, int(base_alpha * fade)))
+            pygame.draw.rect(panel_surface, (255, 255, 255, int(150 * fade)),
+                             (0, 0, panel_width, panel_height), 2, border_radius=8)
             screen.blit(panel_surface, (panel_x, panel_y))
 
-            # Draw instruction text
-            instruction_text = self.font_instruction.render(config["text"], True, text_color)
-            instruction_text.set_alpha(int(255 * alpha))
-            instruction_rect = instruction_text.get_rect(center=(panel_x + panel_width // 2, panel_y + panel_height // 2))
-            screen.blit(instruction_text, instruction_rect)
+            # Draw text centered in panel
+            text_surf.set_alpha(int(255 * fade))
+            text_rect = text_surf.get_rect(center=(panel_x + panel_width // 2, panel_y + panel_height // 2))
+            screen.blit(text_surf, text_rect)
 
-            # Pulsing border for urgent instructions
+            # Pulsing border for urgent alerts
             if alert in (AlertType.STOP, AlertType.EMERGENCY_STOP):
                 pulse = abs(math.sin(elapsed * 5)) * 0.5 + 0.5
                 pulse_surface = pygame.Surface((panel_width + 6, panel_height + 6), pygame.SRCALPHA)
-                pygame.draw.rect(pulse_surface, (255, 80, 80, int(150 * pulse * alpha)),
-                               (0, 0, panel_width + 6, panel_height + 6), 3, border_radius=10)
+                pygame.draw.rect(pulse_surface, (255, 80, 80, int(150 * pulse * fade)),
+                                 (0, 0, panel_width + 6, panel_height + 6), 3, border_radius=10)
                 screen.blit(pulse_surface, (panel_x - 3, panel_y - 3))
 
 
@@ -539,17 +633,25 @@ class DrivingMonitor:
     - Erratic steering
     """
 
-    def __init__(self, world_map: carla.Map, config):
+    def __init__(self, world_map: carla.Map, config, world: carla.World = None):
         self.world_map = world_map
+        self.world = world
         self.config = config
 
         # Thresholds
-        self.lane_drift_warning = 0.8  # meters from center - warning
+        self.lane_drift_warning = 0.8   # meters from center - warning
         self.lane_drift_critical = 1.2  # meters from center - critical
-        self.max_speed_kmh = 50.0  # speed limit
-        self.min_speed_kmh = 10.0  # too slow threshold
-        self.follow_distance_warning = 10.0  # meters
-        self.follow_distance_critical = 5.0  # meters
+        self.speed_limit_kmh = 50.0     # speed limit (SPEEDING alert)
+        self.max_speed_kmh = 50.0       # alias used by SLOW_DOWN logic
+        self.min_speed_kmh = 10.0       # too slow threshold
+        self.follow_distance_warning = 10.0   # meters
+        self.follow_distance_critical = 5.0   # meters
+        self.rear_distance_warning = 10.0     # meters
+        self.rear_distance_critical = 5.0     # meters
+
+        # Standstill-to-acceleration detection
+        self._prev_speed_kmh: float = 0.0
+        self._standstill_cooldown: float = 0.0  # timestamp of last SPEEDUP_FROM_STANDSTILL
 
         # State tracking
         self.lane_offset_history: list = []
@@ -653,8 +755,8 @@ class DrivingMonitor:
             metrics["lane_status"] = "OK"
 
         # === SPEED MONITORING ===
-        if speed_kmh > self.max_speed_kmh:
-            alert_display.trigger_alert(AlertType.SLOW_DOWN, duration=2.0)
+        if speed_kmh > self.speed_limit_kmh:
+            alert_display.trigger_alert(AlertType.SPEEDING, duration=2.0)
             metrics["speed_status"] = "TOO_FAST"
         elif speed_kmh < self.min_speed_kmh and speed_kmh > 1.0:
             # Only alert if actually moving but too slow
@@ -663,21 +765,61 @@ class DrivingMonitor:
         else:
             metrics["speed_status"] = "OK"
 
-        # === FOLLOWING DISTANCE ===
+        # === SPEEDUP FROM STANDSTILL ===
+        now = time.time()
+        if (
+            self._prev_speed_kmh < 2.0
+            and speed_kmh > 8.0
+            and now - self._standstill_cooldown > 5.0
+        ):
+            alert_display.trigger_alert(AlertType.SPEEDUP_FROM_STANDSTILL, duration=3.0)
+            self._standstill_cooldown = now
+        self._prev_speed_kmh = speed_kmh
+
+        # === FOLLOWING DISTANCE (front) ===
         if npc is not None:
             distance = self.get_distance_to_vehicle(ego, npc)
             metrics["distance_to_npc"] = distance
 
             if self.is_vehicle_ahead(ego, npc):
                 if distance < self.follow_distance_critical:
+                    alert_display.trigger_alert(AlertType.FRONT_PROXIMITY_CRITICAL, duration=2.0)
                     metrics["follow_status"] = "CRITICAL"
                 elif distance < self.follow_distance_warning:
-                    alert_display.trigger_alert(AlertType.SLOW_DOWN, duration=2.0)
+                    alert_display.trigger_alert(AlertType.FRONT_PROXIMITY_WARNING, duration=2.0)
                     metrics["follow_status"] = "WARNING"
                 else:
                     metrics["follow_status"] = "OK"
             else:
                 metrics["follow_status"] = "N/A"
+
+        # === PROXIMITY DETECTION (all vehicles via world) ===
+        if self.world is not None:
+            ego_loc = ego.get_location()
+            ego_fwd = ego.get_transform().get_forward_vector()
+
+            for v in self.world.get_actors().filter("vehicle.*"):
+                if v.id == ego.id:
+                    continue
+                rel = v.get_location() - ego_loc
+                dot = rel.x * ego_fwd.x + rel.y * ego_fwd.y
+                dist = math.sqrt(rel.x ** 2 + rel.y ** 2 + rel.z ** 2)
+
+                if dot > 0:
+                    # Vehicle is AHEAD
+                    if dist < self.follow_distance_critical:
+                        alert_display.trigger_alert(AlertType.FRONT_PROXIMITY_CRITICAL, duration=2.0)
+                        metrics["follow_status"] = "CRITICAL"
+                    elif dist < self.follow_distance_warning:
+                        alert_display.trigger_alert(AlertType.FRONT_PROXIMITY_WARNING, duration=2.0)
+                        if metrics.get("follow_status") not in ("CRITICAL",):
+                            metrics["follow_status"] = "WARNING"
+                else:
+                    # Vehicle is BEHIND
+                    if dist < self.rear_distance_critical:
+                        alert_display.trigger_alert(AlertType.REAR_PROXIMITY_CRITICAL, duration=2.0)
+                    elif dist < self.rear_distance_warning:
+                        alert_display.trigger_alert(AlertType.REAR_PROXIMITY_WARNING, duration=2.0)
 
         return metrics
 
@@ -1110,9 +1252,9 @@ def run_manual_drive(
     running = True
 
     # Create instruction display and driving monitor
-    alert_display = AlertDisplay(W, H)
+    alert_display = AlertDisplay(W, H, alert_config=config.alert_display)
     world_map = world.get_map()
-    driving_monitor = DrivingMonitor(world_map, config)
+    driving_monitor = DrivingMonitor(world_map, config, world=world)
 
     # Create episode resetter
     resetter = EpisodeResetter(world, client, config.scenario)
@@ -1139,11 +1281,14 @@ def run_manual_drive(
     print("  1        - Turn Left")
     print("  2        - Turn Right")
     print("  3        - Stop at the light")
+    print("  TAB      - Toggle diagnostics bar")
     print("")
     print("Automatic Alerts:")
     print("  - Lane drifting warnings")
-    print("  - Speed recommendations")
-    print("  - Following distance advice")
+    print("  - Speed limit exceeded (SPEEDING)")
+    print("  - Acceleration from standstill")
+    print("  - Front proximity warning/critical")
+    print("  - Rear proximity warning/critical")
     print("")
     print("Auto-Respawn Triggers:")
     print(f"  - Track end:    x >= {resetter.goal_x}")
@@ -1180,6 +1325,12 @@ def run_manual_drive(
                         alert_display.trigger_navigation(AlertType.TURN_RIGHT, duration=5.0)
                     elif event.key == pygame.K_3:
                         alert_display.trigger_navigation(AlertType.STOP_AT_LIGHT, duration=5.0)
+                    # Toggle diagnostics bar
+                    elif event.key == pygame.K_TAB:
+                        alert_display.alert_config.show_diagnostics_bar = \
+                            not alert_display.alert_config.show_diagnostics_bar
+                        state = "ON" if alert_display.alert_config.show_diagnostics_bar else "OFF"
+                        print(f"[HUD] Diagnostics bar: {state}")
 
                 elif event.type == pygame.JOYBUTTONDOWN:
                     # Button 4 or 5 for reverse on most controllers
@@ -1232,7 +1383,7 @@ def run_manual_drive(
             npc.destroy()
         ego.destroy()
         pygame.quit()
-        print("Done!")
+        kill_all_carla_processes()
 
 
 # =============================================================================
