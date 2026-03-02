@@ -1,0 +1,64 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\setcounter{secnumdepth}{0} % Set the numbering depth to 0
+
+\title{Autonomous Vehicle Training in CARLA}
+
+\author{Alex Johnson, Julian Rodriguez}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+Below is a list of the processes used and lessons learned 
+as we trained our autonomous vehicle in CARLA. After explaining
+our choices and exactly what went right and wrong, we will 
+provide general recommendations for autonomous training based
+on our experiences
+
+\section{What Went Wrong}
+
+\subsection{Custom PPO vs SB3}
+\subsection{Driving Rules}
+Our final car appeared to behave erratically at first, as though it wasn't
+properly obeying driving rules like staying in the speed limit or using the
+right lanes
+\paragraph{}
+
+\subsection{?}
+\subsection{?}
+\subsection{?}
+
+\section{What Went Right}
+
+\subsection{
+WandB
+}
+\paragraph{}{}
+Weights and Biases (WandB) is a platform for storing model metrics during
+machine learning training. It uses a simple Python API that can be inserted
+into a training script. It is free to use and helps us track the model's
+losses, collision rate, episode length, and style adherence, create
+visuals, and monitor our runtime as we train, without even rendering
+the car. It provided a quantitative way to track training, with live
+updates and remote access via the website. 
+\subsection{Style Vectors}
+\paragraph{}
+The style vector idea performed very strongly when rendered. Small changes 
+to the vectors, which are constrained to the interval [0, 1], resulted in large 
+output fluxuations. We found that keeping speed minimal and safety maximal led
+to the smoothest car. In the future, training might want to reduce the loss 
+related to the style vectors to make the model fluctuate less, ie. make the 
+style changes less extreme.
+\subsection{?}
+\subsection{?}
+\subsection{?}
+
+\section{Conclusion}
+
+1 paragraph
+
+\end{document}
