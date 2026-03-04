@@ -4,19 +4,70 @@ import pygame
 import math
 import time
 import traceback
+import os
+import numpy as np
 # from csv_logging import CarlaCSVLogger
 from camera_control import follow_camera
 from parquet_logger import CarlaParquetLogger
 from steering_control import get_wheel_control, get_keyboard_control
-from waypoint import find_adjacent_lane_waypoint, find_forward_waypoint, find_nearest_npc_vehicle, find_random_waypoint, get_relative_lane_and_longitudinal
-from globals import EventState
+from waypoint import find_adjacent_lane_waypoint, find_forward_waypoint
+from alerts import AlertType, Dashboard, DrivingMonitor, AlertDisplayConfig
+
+# Window dimensions (large enough for camera feed + overlay)
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+
 
 def main():
+    # Configure SDL2 environment variables for better XInput/Xbox controller support
+    # These must be set BEFORE pygame.init()
+    os.environ['SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS'] = '1'
+    # Force SDL to use HIDAPI backend (better for XInput devices)
+    os.environ['SDL_JOYSTICK_HIDAPI'] = '1'
+    # Enable XInput support explicitly
+    os.environ['SDL_HINT_JOYSTICK_HIDAPI_XBOX'] = '1'
+
     pygame.init()
-    screen = pygame.display.set_mode((400, 200))
-    pygame.display.set_caption("CARLA Manual Control (focus here, use WASD, R for reverse)")
+    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+    pygame.display.set_caption("CARLA Manual Control (WASD to drive, R=reverse, Tab=HUD, ESC=quit)")
 
     pygame.joystick.init()
+
+    # Additional diagnostic info
+    print("\n=== Joystick Debug Info ===")
+    print("Pygame version:", pygame.version.ver)
+    print("SDL version:", pygame.version.SDL)
+    print("Joystick module initialized:", pygame.joystick.get_init())
+    print("SDL_JOYSTICK_HIDAPI:", os.environ.get('SDL_JOYSTICK_HIDAPI', 'not set'))
+
+    # Try multiple event pumps with longer delays to ensure detection
+    # XInput devices sometimes need more time to enumerate
+    print("\nScanning for joysticks...")
+    for i in range(5):
+        pygame.event.pump()
+        time.sleep(0.2)  # Longer delay for XInput device enumeration
+        current_count = pygame.joystick.get_count()
+        if current_count > 0:
+            print(f"  Found {current_count} device(s) after {i+1} scan(s)")
+
+    joystick_count = pygame.joystick.get_count()
+    print("Number of joysticks detected:", joystick_count)
+
+    if joystick_count == 0:
+        print("No joysticks detected by pygame.")
+        print("Using keyboard controls (WASD).")
+    else:
+        for i in range(joystick_count):
+            joy = pygame.joystick.Joystick(i)
+            joy.init()
+            print(f"\nJoystick {i}:")
+            print("  Name:", joy.get_name())
+            print("  GUID:", joy.get_guid() if hasattr(joy, "get_guid") else "N/A")
+            print("  ID:", joy.get_id() if hasattr(joy, "get_id") else "N/A")
+            print("  Num Axes:", joy.get_numaxes())
+            print("  Num Buttons:", joy.get_numbuttons())
+            print("  Num Hats:", joy.get_numhats())
+    print("===========================\n")
 
     wheel = None
 
@@ -91,6 +142,33 @@ def main():
     event_state = EventState(traffic_manager)
     event_prob = 0.05
 
+    # ---- Attach RGB camera to ego for pygame rendering ----
+    cam_bp = blueprint_library.find("sensor.camera.rgb")
+    cam_bp.set_attribute("image_size_x", str(WINDOW_WIDTH))
+    cam_bp.set_attribute("image_size_y", str(WINDOW_HEIGHT))
+    cam_bp.set_attribute("fov", "100")
+
+    # Driver's seat POV
+    cam_tf = carla.Transform(
+        carla.Location(x=0.2, y=-0.36, z=1.2),
+        carla.Rotation(pitch=-5.0, yaw=0.0, roll=0.0),
+    )
+    camera = world.spawn_actor(cam_bp, cam_tf, attach_to=ego_vehicle)
+
+    latest_image = None
+    def on_image(img):
+        nonlocal latest_image
+        array = np.frombuffer(img.raw_data, dtype=np.uint8)
+        array = array.reshape((img.height, img.width, 4))
+        latest_image = array[:, :, :3][:, :, ::-1]  # BGRA -> RGB
+
+    camera.listen(on_image)
+
+    # ---- Alert system ----
+    alert_config = AlertDisplayConfig()
+    dashboard = Dashboard(WINDOW_WIDTH, WINDOW_HEIGHT, alert_config=alert_config)
+    driving_monitor = DrivingMonitor(world_map, world=world)
+
     spectator = world.get_spectator()
     clock = pygame.time.Clock()
     control = carla.VehicleControl()
@@ -105,6 +183,30 @@ def main():
     # to log to parquet:
     logger = CarlaParquetLogger(world, ego_vehicle, npc_vehicles, log_dir="logs")
 
+    print("\n" + "=" * 50)
+    print("MANUAL DRIVE WITH ALERT SYSTEM")
+    print("=" * 50)
+    print("Driving Controls:")
+    print("  W/Up     - Accelerate")
+    print("  S/Down   - Brake")
+    print("  A/D      - Steer")
+    print("  R        - Toggle reverse")
+    print("  SPACE    - Hand brake")
+    print("  ESC      - Quit")
+    print("")
+    print("Navigation Alerts (test keys):")
+    print("  1        - Turn Left")
+    print("  2        - Turn Right")
+    print("  3        - Stop at the light")
+    print("  TAB      - Toggle diagnostics bar")
+    print("")
+    print("Automatic Alerts:")
+    print("  - Lane drifting warnings")
+    print("  - Speed limit exceeded")
+    print("  - Acceleration from standstill")
+    print("  - Front/rear proximity warnings")
+    print("=" * 50 + "\n")
+
     try:
         while True:
             clock.tick(60)
@@ -114,16 +216,30 @@ def main():
                     print("Received QUIT event")
                     raise SystemExit
                 if event.type == pygame.KEYDOWN:
-                    # 🔁 toggle reverse with R
-                    if event.key == pygame.K_r:
+                    if event.key == pygame.K_ESCAPE:
+                        return
+                    elif event.key == pygame.K_r:
                         reverse_mode = not reverse_mode
                         print("Reverse mode:", reverse_mode)
+                    # Navigation alert test keys
+                    elif event.key == pygame.K_1:
+                        dashboard.trigger_navigation(AlertType.TURN_LEFT, duration=5.0)
+                    elif event.key == pygame.K_2:
+                        dashboard.trigger_navigation(AlertType.TURN_RIGHT, duration=5.0)
+                    elif event.key == pygame.K_3:
+                        dashboard.trigger_navigation(AlertType.STOP_AT_LIGHT, duration=5.0)
+                    # Toggle diagnostics bar
+                    elif event.key == pygame.K_TAB:
+                        dashboard.alert_config.show_diagnostics_bar = \
+                            not dashboard.alert_config.show_diagnostics_bar
+                        state = "ON" if dashboard.alert_config.show_diagnostics_bar else "OFF"
+                        print(f"[HUD] Diagnostics bar: {state}")
                 if event.type == pygame.JOYBUTTONDOWN:
                     # Example: wheel button 4 toggles reverse
                     if event.button == 4:
                         reverse_mode = not reverse_mode
                         print("Reverse mode:", reverse_mode)
-    
+
             if wheel is not None:
                 control = get_wheel_control(wheel, control, reverse_mode)
             else:
@@ -184,6 +300,14 @@ def main():
             elif event_state.in_progress:
                 event_state.tick_override_event()
 
+            # ---- Render camera feed + overlays to pygame ----
+            if latest_image is not None:
+                surf = pygame.surfarray.make_surface(latest_image.swapaxes(0, 1))
+                screen.blit(surf, (0, 0))
+
+            dashboard.render(screen, metrics, reverse_mode)
+            pygame.display.flip()
+
             logger.log_step(control)
 
     except KeyboardInterrupt:
@@ -198,6 +322,10 @@ def main():
         print("Destroying actors...")
         for npc in npc_vehicles:
             npc.destroy()
+        camera.stop()
+        camera.destroy()
+        if npc_vehicle is not None:
+            npc_vehicle.destroy()
         ego_vehicle.destroy()
         pygame.quit()
 
