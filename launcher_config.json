@@ -1,9 +1,0 @@
-{
-  "carla_root": "/home/bryan/utexas/seniordesign-ECE464/HondaAI/CARLA-sim/CARLA_0.9.16",
-  "venv_path": "/home/bryan/utexas/seniordesign-ECE464/HondaAI/venv",
-  "carla_port": 2000,
-  "carla_quality": "Low",
-  "carla_offscreen": false,
-  "custom_scripts": [],
-  "custom_dirs": []
-}

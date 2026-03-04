@@ -4,7 +4,9 @@ HondaAI-CARLA-Launcher — Tkinter GUI for managing CARLA simulator,
 virtual environments, and project scripts.
 
 On first launch a setup wizard runs to configure paths and create a venv.
-Config is saved next to the executable as launcher_config.json.
+A breadcrumb file (.HondaAI-launcher-root) next to the executable stores
+the project root path.  Full config is persisted at
+[project_root]/.HondaAI-CARLA-Launcher/launcher_config.json.
 """
 
 import json
@@ -42,7 +44,10 @@ def _detect_carla_root() -> Path:
 CARLA_ROOT_DEFAULT = _detect_carla_root()
 SCRIPTS_DEFAULT    = CARLA_ROOT_DEFAULT / "PythonAPI" / "examples"
 VENV_DEFAULT       = CARLA_ROOT_DEFAULT / "venv"
-CONFIG_FILE        = _HERE / "launcher_config.json"
+
+# Breadcrumb: lives next to the executable, holds one line = project root path.
+_BREADCRUMB_FILE   = _HERE / ".HondaAI-launcher-root"
+_CONFIG_DIR_NAME   = ".HondaAI-CARLA-Launcher"
 
 _req_candidates = [
     CARLA_ROOT_DEFAULT / "requirements.txt",
@@ -57,37 +62,92 @@ QUALITY_OPTIONS = ["Low", "Medium", "High", "Epic"]
 
 
 # ---------------------------------------------------------------------------
+# Breadcrumb helpers — resolve project root from the small pointer file
+# ---------------------------------------------------------------------------
+
+def _read_breadcrumb() -> Path | None:
+    """Return the project_root stored in the breadcrumb file, or None."""
+    if _BREADCRUMB_FILE.exists():
+        try:
+            text = _BREADCRUMB_FILE.read_text().strip()
+            if text:
+                return Path(text)
+        except Exception:
+            pass
+    return None
+
+
+def _write_breadcrumb(project_root: Path):
+    """Persist project_root into the breadcrumb file next to the executable."""
+    try:
+        _BREADCRUMB_FILE.write_text(str(project_root))
+    except Exception:
+        pass
+
+
+def _config_dir() -> Path | None:
+    """Config directory under the project root, or None if not set up yet."""
+    root = _read_breadcrumb()
+    if root is None:
+        return None
+    return root / _CONFIG_DIR_NAME
+
+
+def _config_file() -> Path | None:
+    """Full path to launcher_config.json, or None if project_root unknown."""
+    d = _config_dir()
+    if d is None:
+        return None
+    return d / "launcher_config.json"
+
+
+# ---------------------------------------------------------------------------
 # Config persistence
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    if CONFIG_FILE.exists():
+    cf = _config_file()
+    if cf is not None and cf.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text())
+            return json.loads(cf.read_text())
         except Exception:
             pass
     return {}
 
 
 def _save_config(data: dict):
+    cf = _config_file()
+    if cf is None:
+        return
     try:
-        CONFIG_FILE.write_text(json.dumps(data, indent=2))
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text(json.dumps(data, indent=2))
     except Exception:
         pass
 
 
+def _has_carla_executable(carla_root: Path) -> bool:
+    """Return True if carla_root contains a valid CARLA executable."""
+    return ((carla_root / "CarlaUE4.sh").exists()
+            or (carla_root / "CarlaUE4.exe").exists())
+
+
 def _needs_setup() -> bool:
-    """Return True if first-run setup should be shown."""
+    """Return True if first-run setup should be shown.
+
+    Checks that the breadcrumb exists and that the configured paths
+    are valid.  The wizard only appears when something is genuinely
+    missing (first run, moved install, deleted venv).
+    """
+    if _read_breadcrumb() is None:
+        return True
     cfg = _load_config()
-    if cfg.get("setup_complete", False):
-        return False
-    # Backward compat: config written before the wizard existed already has
-    # carla_root and venv_path — treat as complete and migrate the file.
-    if cfg.get("carla_root") and cfg.get("venv_path"):
-        cfg["setup_complete"] = True
-        _save_config(cfg)
-        return False
-    return True
+    carla = cfg.get("carla_root", "")
+    venv = cfg.get("venv_path", "")
+    return not (
+        carla and Path(carla).exists() and _has_carla_executable(Path(carla))
+        and venv and Path(venv).exists()
+    )
 
 
 def _pick_directory(title: str, initialdir: str = "", parent=None) -> str | None:
@@ -708,7 +768,6 @@ class SetupWizard(tk.Toplevel):
             "project_root":   self._proj_root.get(),
             "carla_root":     self._carla_root.get(),
             "venv_path":      self._venv_path.get(),
-            "setup_complete": True,
         })
         # on_complete calls root.quit() which exits mainloop;
         # root.destroy() in main() cleans up this window.
@@ -741,8 +800,8 @@ def _pip_bin(venv_path: Path) -> Path:
 
 def _activate_cmd(venv_path: Path) -> str:
     if IS_WINDOWS:
-        return str(venv_path / "Scripts" / "activate.bat")
-    return f"source {venv_path / 'bin' / 'activate'}"
+        return f'call "{venv_path / "Scripts" / "activate.bat"}"'
+    return f"source \"{venv_path / 'bin' / 'activate'}\""
 
 
 def _carla_executable(carla_root: Path) -> Path:
@@ -894,7 +953,8 @@ class CarlaLauncher(tk.Tk):
     # -----------------------------------------------------------------------
 
     def _on_close(self):
-        _save_config({
+        cfg = _load_config()
+        cfg.update({
             "carla_root":      self.carla_root.get(),
             "venv_path":       self.venv_path.get(),
             "carla_port":      self.carla_port.get(),
@@ -903,6 +963,7 @@ class CarlaLauncher(tk.Tk):
             "custom_scripts":  [str(p) for p in self._custom_scripts],
             "custom_dirs":     [str(p) for p in self._custom_dirs],
         })
+        _save_config(cfg)
         self.destroy()
 
     # -----------------------------------------------------------------------
@@ -1376,7 +1437,7 @@ class CarlaLauncher(tk.Tk):
                                  "Check the CARLA installation path.")
             return
 
-        if IS_LINUX and not os.access(exe, os.X_OK):
+        if not IS_WINDOWS and not os.access(exe, os.X_OK):
             self._log(f"Setting +x on {exe.name}")
             try:
                 os.chmod(exe, os.stat(exe).st_mode | 0o755)
@@ -1408,7 +1469,7 @@ class CarlaLauncher(tk.Tk):
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 if IS_WINDOWS:
                     kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else:
+                elif IS_LINUX:
                     kwargs["preexec_fn"] = os.setsid
                 proc = subprocess.Popen(cmd, **kwargs)
                 self.registry.add(ProcessEntry("CARLA", "CARLA", proc, " ".join(cmd)))
@@ -1700,10 +1761,10 @@ class CarlaLauncher(tk.Tk):
             p = Path(f)
             if p not in self._custom_scripts:
                 self._custom_scripts.append(p)
-                _save_config({
-                    "custom_scripts": [str(x) for x in self._custom_scripts],
-                    "custom_dirs":    [str(x) for x in self._custom_dirs],
-                })
+                cfg = _load_config()
+                cfg["custom_scripts"] = [str(x) for x in self._custom_scripts]
+                cfg["custom_dirs"]    = [str(x) for x in self._custom_dirs]
+                _save_config(cfg)
             self._reload_scripts()
 
     def _add_custom_dir(self):
@@ -1712,10 +1773,10 @@ class CarlaLauncher(tk.Tk):
             p = Path(d)
             if p not in self._custom_dirs:
                 self._custom_dirs.append(p)
-                _save_config({
-                    "custom_scripts": [str(x) for x in self._custom_scripts],
-                    "custom_dirs":    [str(x) for x in self._custom_dirs],
-                })
+                cfg = _load_config()
+                cfg["custom_scripts"] = [str(x) for x in self._custom_scripts]
+                cfg["custom_dirs"]    = [str(x) for x in self._custom_dirs]
+                _save_config(cfg)
             self._reload_scripts()
 
     def _remove_selected_script(self):
@@ -1736,10 +1797,10 @@ class CarlaLauncher(tk.Tk):
                 "Cannot remove built-in example scripts.\n"
                 "Change the examples directory path instead.")
             return
-        _save_config({
-            "custom_scripts": [str(x) for x in self._custom_scripts],
-            "custom_dirs":    [str(x) for x in self._custom_dirs],
-        })
+        cfg = _load_config()
+        cfg["custom_scripts"] = [str(x) for x in self._custom_scripts]
+        cfg["custom_dirs"]    = [str(x) for x in self._custom_dirs]
+        _save_config(cfg)
         self._reload_scripts()
 
     def _launch_selected_script(self):
@@ -1803,10 +1864,48 @@ class CarlaLauncher(tk.Tk):
 
 
 # ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+def _migrate_old_config():
+    """One-time migration: move old launcher_config.json (next to executable)
+    into the new [project_root]/.HondaAI-CARLA-Launcher/ directory."""
+    old_cfg_file = _HERE / "launcher_config.json"
+    if not old_cfg_file.exists():
+        return
+    if _read_breadcrumb() is not None:
+        return  # already migrated
+
+    try:
+        data = json.loads(old_cfg_file.read_text())
+    except Exception:
+        return
+
+    project_root_str = data.get("project_root", "")
+    if not project_root_str:
+        # Old configs lack project_root — infer from _HERE (the launcher's dir).
+        project_root_str = str(_HERE)
+
+    project_root = Path(project_root_str)
+    if not project_root.exists():
+        return
+
+    _write_breadcrumb(project_root)
+    _save_config(data)
+
+    try:
+        old_cfg_file.rename(_HERE / "launcher_config.json.migrated")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
+    _migrate_old_config()
+
     # Hidden root owns the wizard as a Toplevel (required by Tk)
     root = tk.Tk()
     root.withdraw()
@@ -1815,6 +1914,8 @@ def main():
         result: dict = {}
 
         def _on_setup_complete(cfg: dict):
+            # Write breadcrumb FIRST — _config_file() depends on it.
+            _write_breadcrumb(Path(cfg["project_root"]))
             existing = _load_config()
             existing.update(cfg)
             _save_config(existing)
@@ -1825,8 +1926,8 @@ def main():
         root.mainloop()   # blocks until root.quit()
         root.destroy()    # now safe to destroy
 
-        if not result.get("setup_complete"):
-            return        # wizard was cancelled
+        if _needs_setup():
+            return        # wizard was cancelled or paths still invalid
     else:
         root.destroy()
 
