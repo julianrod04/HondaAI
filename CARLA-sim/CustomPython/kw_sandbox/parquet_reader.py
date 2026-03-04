@@ -2,20 +2,15 @@ import argparse
 from pathlib import Path
 
 import duckdb
-import pyarrow.parquet as pq  # used only for writing the optional output
+import pyarrow.parquet as pq
 
 
 def sql_escape_literal(s: str) -> str:
-    """
-    Escape a Python string for use as a single-quoted SQL literal.
-    """
     return s.replace("'", "''")
 
 
 def get_columns(con: duckdb.DuckDBPyConnection, parquet_path: str) -> set:
-    """
-    Return a set of column names in the Parquet file using DuckDB.
-    """
+    # Return a set of column names in the Parquet file
     escaped = sql_escape_literal(parquet_path)
     rows = con.execute(
         f"DESCRIBE SELECT * FROM parquet_scan('{escaped}')"
@@ -25,12 +20,8 @@ def get_columns(con: duckdb.DuckDBPyConnection, parquet_path: str) -> set:
 
 
 def build_distance_expr(cols: set) -> str:
-    """
-    Decide how to get the ego–NPC distance expression:
-
-    - If the Parquet has 'distance_ego_npc', we just use that.
-    - Otherwise, we compute it from ego_x, ego_y, npc_x, npc_y.
-    """
+    # If the Parquet has 'distance_ego_npc', we just use that. Otherwise, we compute it from 
+    # ego_x, ego_y, npc_x, npc_y.
     if "distance_ego_npc" in cols:
         return "distance_ego_npc"
 
@@ -46,14 +37,7 @@ def build_distance_expr(cols: set) -> str:
 
 
 def make_distance_subquery(parquet_path: str, distance_expr: str) -> str:
-    """
-    Build a subquery that produces:
-
-        SELECT frame, sim_time, <distance_expr> AS dist
-        FROM parquet_scan(...)
-
-    We’ll reuse this subquery in all our queries (count/min/max/export).
-    """
+    # Build a subquery which can be reused in all our queries (count/min/max/export).
     escaped = sql_escape_literal(parquet_path)
     subquery = f"""
         SELECT
@@ -69,19 +53,12 @@ def compute_summary(
     con: duckdb.DuckDBPyConnection,
     distance_subquery: str,
 ):
-    """
-    Using the distance subquery, compute:
+    # Compute and return:
+    # - number of valid samples
+    # - row with minimum distance
+    # - row with maximum distance
 
-        - number of valid samples (dist >= 0)
-        - row with minimum distance
-        - row with maximum distance
-
-    Returns:
-        min_row: (frame, sim_time, dist)
-        max_row: (frame, sim_time, dist)
-        count_valid: int
-    """
-    # Count valid rows (dist >= 0; negative could mean "no NPC")
+    # valid rows where dist >= 0 - negative could mean there is no NPC in the sim
     count_valid = con.execute(
         f"""
         SELECT COUNT(*)
@@ -123,19 +100,10 @@ def export_distances(
     distance_subquery: str,
     output_path: str,
 ):
-    """
-    Export per-frame distances to a new Parquet file with columns:
-
-        frame, sim_time, distance_ego_npc
-
-    We:
-      - use DuckDB to materialize the result as an Arrow table
-      - write it with PyArrow, no pandas/numpy anywhere.
-    """
+    # For each frame, export frame, sim time, and ego-npc distances to a new Parquet file 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use DuckDB to compute the table, then fetch as Arrow
     arrow_table = con.execute(
         f"""
         SELECT
@@ -173,17 +141,16 @@ def main():
 
     con = duckdb.connect()
 
-    # 1) Inspect schema
+    # Inspect schema
     cols = get_columns(con, parquet_path.as_posix())
 
-    # 2) Build distance expression and subquery
+    # Build distance expression and subquery
     distance_expr = build_distance_expr(cols)
     distance_subquery = make_distance_subquery(parquet_path.as_posix(), distance_expr)
 
-    # 3) Compute summary stats
+    # Compute summary stats
     min_row, max_row, count_valid = compute_summary(con, distance_subquery)
 
-    # min_row / max_row are tuples: (frame, sim_time, dist)
     min_frame, min_time, min_dist = min_row
     max_frame, max_time, max_dist = max_row
 
@@ -198,7 +165,7 @@ def main():
     print(f"  at frame: {int(max_frame)}")
     print(f"  at sim_time: {float(max_time):.3f} s")
 
-    # 4) Optional export
+    # export
     if args.out is not None:
         export_distances(con, distance_subquery, args.out)
 

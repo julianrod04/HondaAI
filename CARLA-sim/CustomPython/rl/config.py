@@ -5,7 +5,7 @@ All hardcoded values are consolidated here for maintainability.
 """
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -139,15 +139,48 @@ class TrainingConfig:
 
 
 @dataclass
+class AlertDisplayConfig:
+    """Global alert overlay appearance and layout configuration.
+
+    Two independent panels:
+      FOV panel        – large center overlay (navigation / critical alerts)
+      Dashboard panel  – compact banner above the HUD bar (speed / lane alerts)
+    """
+
+    # ---- FOV panel (field-of-vision, Panel 1) --------------------------------
+    width: int = 450                                    # panel width in pixels
+    height: int = 80                                    # panel height in pixels
+    position: str = "top-center"                            # "center", "top-center", "top-left",
+                                                        # "top-right", "bottom-left", "bottom-right"
+    custom_x: Optional[int] = None                      # pixel override (None = use position string)
+    custom_y: Optional[int] = None
+    text_color: Tuple[int, int, int] = (255, 255, 255)
+    bg_color_override: Optional[Tuple[int, int, int]] = None  # None = use per-alert color
+    alpha: int = 100                                    # 0-255 background transparency
+
+    # ---- Dashboard alert panel (Panel 2) -------------------------------------
+    dashboard_position: str = "bottom-right"            # "bottom-left", "bottom-center", "bottom-right"
+    dashboard_alpha: int = 200                          # 0-255 background transparency
+    dashboard_text_color: Optional[Tuple[int, int, int]] = None       # None = use per-alert color
+    dashboard_bg_color_override: Optional[Tuple[int, int, int]] = None  # None = use per-alert color
+    dashboard_padding_x: int = 24                       # horizontal padding around text (px)
+    dashboard_padding_y: int = 12                       # vertical padding around text (px)
+
+    # ---- General -------------------------------------------------------------
+    show_diagnostics_bar: bool = True                   # toggle bottom HUD bar (Tab key)
+
+
+@dataclass
 class FullConfig:
     """Complete configuration combining all sub-configs."""
-    
+
     carla: CarlaConfig = field(default_factory=CarlaConfig)
     scenario: ScenarioConfig = field(default_factory=ScenarioConfig)
     vehicle: VehicleConfig = field(default_factory=VehicleConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    alert_display: AlertDisplayConfig = field(default_factory=AlertDisplayConfig)
 
 
 # Default configuration instance

@@ -247,29 +247,40 @@ def launch_servers(
     return processes
 
 
+def _kill_all_carla_processes() -> None:
+    """Force-kill any remaining CarlaUE4 processes (wrapper + shipping binary)."""
+    print("  Sweeping for remaining CARLA processes...")
+    if platform.system() == "Windows":
+        for name in ("CarlaUE4.exe", "CarlaUE4-Win64-Shipping.exe"):
+            subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True)
+    else:
+        # pkill -9 catches both CarlaUE4.sh and CarlaUE4-Linux-Shipping
+        subprocess.run(["pkill", "-9", "-f", "CarlaUE4"], capture_output=True)
+
+
 def stop_servers(processes: List[subprocess.Popen]) -> None:
     """
     Stop all running CARLA server instances.
-    
+
     Args:
         processes: List of Popen process objects
     """
     print(f"Stopping {len(processes)} CARLA instances...")
-    
+
     system = platform.system()
-    
+
     for i, process in enumerate(processes):
         try:
             if process.poll() is None:  # Still running
                 print(f"  Stopping instance {i} (PID={process.pid})...", end=" ")
-                
+
                 if system == "Windows":
                     # Windows: send CTRL_BREAK_EVENT
                     process.send_signal(signal.CTRL_BREAK_EVENT)
                 else:
                     # Linux: send SIGTERM to process group
                     os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                
+
                 # Wait for graceful shutdown
                 try:
                     process.wait(timeout=10)
@@ -282,7 +293,9 @@ def stop_servers(processes: List[subprocess.Popen]) -> None:
                 print(f"  Instance {i} already stopped")
         except Exception as e:
             print(f"  Error stopping instance {i}: {e}")
-    
+
+    # Final sweep — catches CarlaUE4-Linux-Shipping children that survive SIGTERM
+    _kill_all_carla_processes()
     print("All instances stopped.")
 
 
@@ -352,6 +365,9 @@ def stop_servers_from_pid_file(pid_file: Path) -> None:
         except (ProcessLookupError, OSError) as e:
             print(f"not running ({e})")
     
+    # Final sweep for any remaining CARLA processes
+    _kill_all_carla_processes()
+
     # Clean up PID file
     try:
         pid_file.unlink()

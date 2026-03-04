@@ -3,9 +3,11 @@ import random
 import pygame
 import math
 import time
+import traceback
 import os
 import numpy as np
 # from csv_logging import CarlaCSVLogger
+from camera_control import follow_camera
 from parquet_logger import CarlaParquetLogger
 from steering_control import get_wheel_control, get_keyboard_control
 from waypoint import find_adjacent_lane_waypoint, find_forward_waypoint
@@ -77,7 +79,7 @@ def main():
         print("Using wheel:", wheel.get_name())
 
     client = carla.Client("localhost", 2000)
-    client.set_timeout(5.0)
+    client.set_timeout(10.0)
 
     world = client.get_world()
     world_map = world.get_map()
@@ -100,43 +102,45 @@ def main():
     # npc_spawn_tf = find_adjacent_lane_waypoint(world_map, ego_spawn)
 
     # Find forward lane transform for NPS:
-    npc_spawn_tf = find_forward_waypoint(world_map, ego_spawn)
-    if npc_spawn_tf is None:
-        print("No adjacent lane found – spawning NPC a bit ahead in same lane instead.")
-        # If no adjacent lane, just spawn ahead of ego in same lane (offset along road)
-        ego_wp = world_map.get_waypoint(ego_spawn.location)
-        forward_wp = ego_wp.next(10.0)[0]  # 10 meters ahead
-        npc_spawn_tf = forward_wp.transform
-
-    # Slightly offset NPC forward so they don't collide at spawn
-    npc_spawn_tf.location.x += 1.0
-    npc_spawn_tf.location.z += 0.5  # small lift to avoid ground collision
-
-    npc_vehicle = world.try_spawn_actor(npc_bp, npc_spawn_tf)
-    if npc_vehicle is None:
-        print("Failed to spawn NPC vehicle. Only ego will be present.")
-    else:
-        print("Spawned NPC vehicle:", npc_vehicle.id)
-
-    # Traffic Manager for NPC constant-ish speed
+    npc_vehicles = []
     traffic_manager = client.get_trafficmanager()
     tm_port = traffic_manager.get_port()
+    for i in range(10):
+        npc_spawn_tf = find_random_waypoint(world)
 
-    if npc_vehicle is not None:
-        # Register with TM
-        npc_vehicle.set_autopilot(True, tm_port)
+        # Slightly offset NPC forward so they don't collide at spawn
+        # npc_spawn_tf.location.x += 1.0
+        npc_spawn_tf.location.z += 0.5  # small lift to avoid ground collision
 
-        # Make TM non-synchronous for simplicity
-        traffic_manager.set_synchronous_mode(False)
+        npc_vehicle = world.try_spawn_actor(npc_bp, npc_spawn_tf)
+        if npc_vehicle is None:
+            print("Failed to spawn NPC vehicle. Only ego will be present.")
+        else:
+            print("Spawned NPC vehicle:", npc_vehicle.id)
+            npc_vehicles.append(npc_vehicle)
 
-        # Set desired speed: 0% difference = speed limit, positive = slower, negative = faster
-        desired_slower_percent = 0.0  # change this to 20 or -20, etc.
-        traffic_manager.vehicle_percentage_speed_difference(
-            npc_vehicle, desired_slower_percent
-        )
+        if npc_vehicle is not None:
+            # Register with TM
+            npc_vehicle.set_autopilot(True, tm_port)
 
-        # Disable lane changes if you want it to stay in its lane:
-        traffic_manager.auto_lane_change(npc_vehicle, False)
+            # Make TM non-synchronous for simplicity
+            traffic_manager.set_synchronous_mode(False)
+
+            # Set desired speed: 0% difference = speed limit, positive = slower, negative = faster
+            desired_slower_percent = 0.0  # change this to 20 or -20, etc.
+            traffic_manager.vehicle_percentage_speed_difference(
+                npc_vehicle, desired_slower_percent
+            )
+
+            # Disable lane changes if you want it to stay in its lane:
+            traffic_manager.auto_lane_change(npc_vehicle, False)
+
+    print(npc_vehicles)
+    # Use the first NPC for logging compatibility (if any)
+    npc_vehicle = npc_vehicles[0] if npc_vehicles else None
+
+    event_state = EventState(traffic_manager)
+    event_prob = 0.05
 
     # ---- Attach RGB camera to ego for pygame rendering ----
     cam_bp = blueprint_library.find("sensor.camera.rgb")
@@ -177,7 +181,7 @@ def main():
     # to log to csv:
     # logger = CarlaCSVLogger(world, ego_vehicle, npc_vehicle, log_dir="logs")
     # to log to parquet:
-    logger = CarlaParquetLogger(world, ego_vehicle, npc_vehicle, log_dir="logs")
+    logger = CarlaParquetLogger(world, ego_vehicle, npc_vehicles, log_dir="logs")
 
     print("\n" + "=" * 50)
     print("MANUAL DRIVE WITH ALERT SYSTEM")
@@ -209,7 +213,8 @@ def main():
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    return
+                    print("Received QUIT event")
+                    raise SystemExit
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         return
@@ -242,26 +247,58 @@ def main():
                 control = get_keyboard_control(keys, control, reverse_mode)
 
             ego_vehicle.apply_control(control)
+            # keys = pygame.key.get_pressed()
+            # control = get_keyboard_control(keys, control, reverse_mode)
+            # control = get_wheel_control(wheel, control, reverse_mode)
+            # ego_vehicle.apply_control(control)
 
-            # Update driving monitor (triggers alerts automatically)
-            metrics = driving_monitor.update(ego_vehicle, npc_vehicle, dashboard)
+            # if npc_vehicle is not None:
+            #     elapsed = time.time() - npc_start_time
 
-            # ---- follow camera (CARLA spectator) ----
-            transform = ego_vehicle.get_transform()
-            location = transform.location
-            rotation = transform.rotation
+            #     if elapsed < 5.0:
+            #         # drive straight at constant throttle
+            #         npc_control.throttle = 0.5
+            #         npc_control.brake = 0.0
+            #     else:
+            #         # brake hard
+            #         npc_control.throttle = 0.0
+            #         npc_control.brake = 1.0
 
-            distance_back = 6.0
-            height = 3.0
-            yaw = math.radians(rotation.yaw)
+            #     npc_control.steer = 0.0
+            #     npc_control.hand_brake = False
+            #     npc_control.reverse = False
 
-            follow_x = location.x - distance_back * math.cos(yaw)
-            follow_y = location.y - distance_back * math.sin(yaw)
-            follow_z = location.z + height
+            #     npc_vehicle.apply_control(npc_control)
 
-            camera_location = carla.Location(follow_x, follow_y, follow_z)
-            camera_rotation = carla.Rotation(pitch=-15.0, yaw=rotation.yaw, roll=0.0)
-            spectator.set_transform(carla.Transform(camera_location, camera_rotation))
+            # ---- follow camera ----
+            # follow_camera(ego_vehicle)
+            # transform = ego_vehicle.get_transform()
+            # location = transform.location
+            # rotation = transform.rotation
+
+            # distance_back = 6.0
+            # height = 3.0
+            # yaw = math.radians(rotation.yaw)
+
+            # follow_x = location.x - distance_back * math.cos(yaw)
+            # follow_y = location.y - distance_back * math.sin(yaw)
+            # follow_z = location.z + height
+
+            # camera_location = carla.Location(follow_x, follow_y, follow_z)
+            # camera_rotation = carla.Rotation(pitch=-15.0, yaw=rotation.yaw, roll=0.0)
+            camera_transform = follow_camera(ego_vehicle)
+            spectator.set_transform(camera_transform)
+
+            # throw random npc behavior
+            if not event_state.in_progress and random.random() < event_prob:
+                # first find nearest npc
+                nearest_npc = find_nearest_npc_vehicle(world, ego_vehicle)
+                lane_relative_to_ego, ahead_or_behind_ego, distance_to_ego = get_relative_lane_and_longitudinal(world_map, ego_vehicle, nearest_npc)
+                print(lane_relative_to_ego, ahead_or_behind_ego)
+                event_state.select_behavior(nearest_npc, lane_relative_to_ego, ahead_or_behind_ego)
+                print(event_state.in_progress)
+            elif event_state.in_progress:
+                event_state.tick_override_event()
 
             # ---- Render camera feed + overlays to pygame ----
             if latest_image is not None:
@@ -273,9 +310,18 @@ def main():
 
             logger.log_step(control)
 
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt (Ctrl+C)")
+
+    except Exception as e:
+        print("Exception occurred:", repr(e))
+        traceback.print_exc()
+    
     finally:
         logger.close()
         print("Destroying actors...")
+        for npc in npc_vehicles:
+            npc.destroy()
         camera.stop()
         camera.destroy()
         if npc_vehicle is not None:

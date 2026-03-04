@@ -1,23 +1,3 @@
-# carla_parquet_logger.py
-#
-# Parquet logger for CARLA simulations.
-#
-# Usage from your main script:
-#
-#   from carla_parquet_logger import CarlaParquetLogger
-#
-#   logger = CarlaParquetLogger(world, ego_vehicle, npc_vehicle, log_dir="logs")
-#   ...
-#   while running:
-#       control = get_keyboard_control(...)
-#       ego_vehicle.apply_control(control)
-#       logger.log_step(control)
-#   ...
-#   logger.close()
-#
-# Requires:
-#   pip install pyarrow
-
 import math
 import datetime
 from pathlib import Path
@@ -27,32 +7,19 @@ import pyarrow.parquet as pq
 
 
 class CarlaParquetLogger:
-    """
-    Owns:
-      - in-memory buffers for each logged column
-      - Parquet writing at the end of the run
+    # create one instance per run
+    # call log_step(control) once per frame
+    # call close() at the end
 
-    You:
-      - create one instance per run
-      - call log_step(control) once per frame
-      - call close() at the end
-    """
-
-    def __init__(self, world, ego_vehicle, npc_vehicle=None, log_dir="logs", run_id=None):
-        """
-        Parameters
-        ----------
-        world : carla.World
-        ego_vehicle : carla.Vehicle
-        npc_vehicle : carla.Vehicle or None
-        log_dir : str
-            Directory in which Parquet file will be written.
-        run_id : str or None
-            Optional identifier to include in the filename.
-        """
+    def __init__(self, world, ego_vehicle, npc_vehicles=None, log_dir="logs", run_id=None):
+        # world : carla.World
+        # ego_vehicle : carla.Vehicle
+        # npc_vehicles : list[carla.Vehicle] or None
+        # log_dir : str. Directory in which Parquet file will be written.
+        # run_id : str or None. Optional identifier to include in the filename.
         self.world = world
         self.ego_vehicle = ego_vehicle
-        self.npc_vehicle = npc_vehicle
+        self.npc_vehicles = list(npc_vehicles) if npc_vehicles else []
 
         # Prepare output path
         self.log_dir = Path(log_dir)
@@ -66,7 +33,7 @@ class CarlaParquetLogger:
 
         self.file_path = self.log_dir / filename
 
-        # In-memory column buffers; keys are column names, values are Python lists
+        # In-memory column buffers - keys are column names, values are Python lists
         self._cols = {
             "frame": [],
             "sim_time": [],
@@ -87,6 +54,7 @@ class CarlaParquetLogger:
             "ego_hand_brake": [],
 
             "npc_present": [],
+            "npc_id": [],
             "npc_x": [],
             "npc_y": [],
             "npc_z": [],
@@ -103,23 +71,17 @@ class CarlaParquetLogger:
         print(f"[CarlaParquetLogger] Logging to: {self.file_path}")
 
     def log_step(self, control):
-        """
-        Log one simulation frame.
-
-        Parameters
-        ----------
-        control : carla.VehicleControl
-            The control applied to the ego vehicle this frame.
-        """
+        # Log one simulation frame.
+        # control : carla.VehicleControl - The control applied to the ego vehicle this frame.
         if self._closed:
-            # Silently ignore or raise; here we raise to catch misuse
+            # Catch misuse
             raise RuntimeError("CarlaParquetLogger.log_step() called after close().")
 
         world = self.world
         ego_vehicle = self.ego_vehicle
-        npc_vehicle = self.npc_vehicle
+        npc_vehicles = self.npc_vehicles
 
-        # Snapshot / timing
+        # Timing within sim
         snapshot = world.get_snapshot()
         sim_time = snapshot.timestamp.elapsed_seconds
         frame_id = snapshot.frame
@@ -141,13 +103,103 @@ class CarlaParquetLogger:
         ego_reverse_flag = bool(control.reverse)
         ego_hand_brake_flag = bool(control.hand_brake)
 
-        # NPC state
-        npc_present = npc_vehicle is not None
-        if npc_present:
-            npc_tf = npc_vehicle.get_transform()
+        def append_row(
+            npc_present,
+            npc_id,
+            npc_x,
+            npc_y,
+            npc_z,
+            npc_yaw,
+            npc_vx,
+            npc_vy,
+            npc_vz,
+            npc_speed,
+            distance_ego_npc,
+        ):
+            self._cols["frame"].append(int(frame_id))
+            self._cols["sim_time"].append(float(sim_time))
+
+            self._cols["ego_x"].append(float(ego_loc.x))
+            self._cols["ego_y"].append(float(ego_loc.y))
+            self._cols["ego_z"].append(float(ego_loc.z))
+            self._cols["ego_yaw"].append(float(ego_rot.yaw))
+            self._cols["ego_vx"].append(float(ego_vel.x))
+            self._cols["ego_vy"].append(float(ego_vel.y))
+            self._cols["ego_vz"].append(float(ego_vel.z))
+            self._cols["ego_speed"].append(float(ego_speed))
+
+            self._cols["ego_throttle"].append(ego_throttle)
+            self._cols["ego_steer"].append(ego_steer)
+            self._cols["ego_brake"].append(ego_brake)
+            self._cols["ego_reverse"].append(ego_reverse_flag)
+            self._cols["ego_hand_brake"].append(ego_hand_brake_flag)
+
+            self._cols["npc_present"].append(bool(npc_present))
+            self._cols["npc_id"].append(int(npc_id))
+            self._cols["npc_x"].append(float(npc_x))
+            self._cols["npc_y"].append(float(npc_y))
+            self._cols["npc_z"].append(float(npc_z))
+            self._cols["npc_yaw"].append(float(npc_yaw))
+            self._cols["npc_vx"].append(float(npc_vx))
+            self._cols["npc_vy"].append(float(npc_vy))
+            self._cols["npc_vz"].append(float(npc_vz))
+            self._cols["npc_speed"].append(float(npc_speed))
+
+            self._cols["distance_ego_npc"].append(float(distance_ego_npc))
+
+        if not npc_vehicles:
+            append_row(
+                npc_present=False,
+                npc_id=-1,
+                npc_x=0.0,
+                npc_y=0.0,
+                npc_z=0.0,
+                npc_yaw=0.0,
+                npc_vx=0.0,
+                npc_vy=0.0,
+                npc_vz=0.0,
+                npc_speed=0.0,
+                distance_ego_npc=-1.0,  # sentinel meaning "no npc"
+            )
+            return
+
+        for npc in npc_vehicles:
+            if npc is None:
+                append_row(
+                    npc_present=False,
+                    npc_id=-1,
+                    npc_x=0.0,
+                    npc_y=0.0,
+                    npc_z=0.0,
+                    npc_yaw=0.0,
+                    npc_vx=0.0,
+                    npc_vy=0.0,
+                    npc_vz=0.0,
+                    npc_speed=0.0,
+                    distance_ego_npc=-1.0,
+                )
+                continue
+
+            if hasattr(npc, "is_alive") and not npc.is_alive:
+                append_row(
+                    npc_present=False,
+                    npc_id=npc.id,
+                    npc_x=0.0,
+                    npc_y=0.0,
+                    npc_z=0.0,
+                    npc_yaw=0.0,
+                    npc_vx=0.0,
+                    npc_vy=0.0,
+                    npc_vz=0.0,
+                    npc_speed=0.0,
+                    distance_ego_npc=-1.0,
+                )
+                continue
+
+            npc_tf = npc.get_transform()
             npc_loc = npc_tf.location
             npc_rot = npc_tf.rotation
-            npc_vel = npc_vehicle.get_velocity()
+            npc_vel = npc.get_velocity()
 
             npc_x = float(npc_loc.x)
             npc_y = float(npc_loc.y)
@@ -161,49 +213,23 @@ class CarlaParquetLogger:
             dx = ego_loc.x - npc_loc.x
             dy = ego_loc.y - npc_loc.y
             distance_ego_npc = math.sqrt(dx ** 2 + dy ** 2)
-        else:
-            npc_x = npc_y = npc_z = 0.0
-            npc_yaw = 0.0
-            npc_vx = npc_vy = npc_vz = 0.0
-            npc_speed = 0.0
-            distance_ego_npc = -1.0  # sentinel meaning "no npc"
 
-        # Append to buffers
-        self._cols["frame"].append(int(frame_id))
-        self._cols["sim_time"].append(float(sim_time))
-
-        self._cols["ego_x"].append(float(ego_loc.x))
-        self._cols["ego_y"].append(float(ego_loc.y))
-        self._cols["ego_z"].append(float(ego_loc.z))
-        self._cols["ego_yaw"].append(float(ego_rot.yaw))
-        self._cols["ego_vx"].append(float(ego_vel.x))
-        self._cols["ego_vy"].append(float(ego_vel.y))
-        self._cols["ego_vz"].append(float(ego_vel.z))
-        self._cols["ego_speed"].append(float(ego_speed))
-
-        self._cols["ego_throttle"].append(ego_throttle)
-        self._cols["ego_steer"].append(ego_steer)
-        self._cols["ego_brake"].append(ego_brake)
-        self._cols["ego_reverse"].append(ego_reverse_flag)
-        self._cols["ego_hand_brake"].append(ego_hand_brake_flag)
-
-        self._cols["npc_present"].append(bool(npc_present))
-        self._cols["npc_x"].append(float(npc_x))
-        self._cols["npc_y"].append(float(npc_y))
-        self._cols["npc_z"].append(float(npc_z))
-        self._cols["npc_yaw"].append(float(npc_yaw))
-        self._cols["npc_vx"].append(float(npc_vx))
-        self._cols["npc_vy"].append(float(npc_vy))
-        self._cols["npc_vz"].append(float(npc_vz))
-        self._cols["npc_speed"].append(float(npc_speed))
-
-        self._cols["distance_ego_npc"].append(float(distance_ego_npc))
+            append_row(
+                npc_present=True,
+                npc_id=npc.id,
+                npc_x=npc_x,
+                npc_y=npc_y,
+                npc_z=npc_z,
+                npc_yaw=npc_yaw,
+                npc_vx=npc_vx,
+                npc_vy=npc_vy,
+                npc_vz=npc_vz,
+                npc_speed=npc_speed,
+                distance_ego_npc=distance_ego_npc,
+            )
 
     def close(self):
-        """
-        Convert the buffers to a PyArrow Table and write to a Parquet file.
-        Safe to call multiple times, but only writes once.
-        """
+        # Convert the buffers to a PyArrow Table and write to a Parquet file.
         if self._closed:
             return
 
