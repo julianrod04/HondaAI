@@ -149,8 +149,9 @@ class HumanStyleRegressor:
         self._prev_yaw:              float = 0.0
         self._prev_acc_vec                 = None  # carla.Vector3D or None
 
-        # Collision counter consumed by aggressiveness()
+        # Collision counter and per-tick flag for aggressiveness boosting
         self._collision_cnt: int = 0
+        self._collision_this_tick: bool = False  # set by sensor callback, cleared each tick
         self._collision_sensor       = None
 
         self._prev_time: float = time.time()
@@ -236,12 +237,17 @@ class HumanStyleRegressor:
             ego_vehicle, measurements, throttle
         )
 
+        # Always pass collision_cnt=0 so physics (acceleration/yaw) are computed every tick.
+        # Then spike aggressiveness if a collision occurred this tick.
         raw_aggr = CarlaEnvUtils.aggressiveness(
             ego_vehicle, measurements,
-            self._collision_cnt,
+            0,
             self._prev_acc_longitudinal,
             done=False,
         )
+        if self._collision_this_tick:
+            raw_aggr += _AGGR_MAX  # collision → max aggressiveness for this tick
+        self._collision_this_tick = False
 
         raw_comfort = CarlaEnvUtils.comfort(
             ego_vehicle, measurements,
@@ -315,6 +321,7 @@ class HumanStyleRegressor:
         self._prev_yaw              = 0.0
         self._prev_acc_vec          = None
         self._collision_cnt         = 0
+        self._collision_this_tick   = False
         self._n_ticks               = 0
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -322,8 +329,9 @@ class HumanStyleRegressor:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _on_collision(self, _event) -> None:
-        """CARLA collision sensor callback — increments the collision counter."""
+        """CARLA collision sensor callback — increments the collision counter and flags this tick."""
         self._collision_cnt += 1
+        self._collision_this_tick = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

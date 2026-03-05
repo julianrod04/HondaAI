@@ -117,12 +117,14 @@ def get_wheel_control(
 
     # ---- Brake (Axis 1) ----
     brake_axis = wheel.get_axis(1)  # -1 rest, +1 pressed
+    # print('brake_axis', brake_axis)
     brake_val = (brake_axis + 1.0) / 2.0
     if brake_val < 0.15:   # wide deadzone so resting pedal never applies brake
         brake_val = 0.0
     # Gentle power curve: light tap = light brake, full press = full brake
     brake_val = brake_val ** 3.0
     control.brake = float(max(0.0, min(1.0, brake_val)))
+    # print('control', control.brake)
     if debug:
         print(f"[wheel] brake={control.brake:.3f}")
 

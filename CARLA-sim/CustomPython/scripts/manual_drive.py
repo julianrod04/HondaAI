@@ -959,7 +959,6 @@ class EpisodeResetter:
             # Re-enable autopilot via Traffic Manager
             tm = self.client.get_trafficmanager()
             npc.set_autopilot(True, tm.get_port())
-            tm.set_desired_speed(npc, DEFAULT_CONFIG.vehicle.npc_target_speed_kmh)
             tm.auto_lane_change(npc, False)
 
         print("[Reset] Done")
@@ -1143,7 +1142,7 @@ def run_manual_drive(
     if config is None:
         config = DEFAULT_CONFIG
 
-    # Async mode for smooth driving
+    # Async mode for smooth real-time human driving
     settings = world.get_settings()
     settings.synchronous_mode = False
     settings.fixed_delta_seconds = None
@@ -1196,7 +1195,6 @@ def run_manual_drive(
         if npc:
             tm = client.get_trafficmanager()
             npc.set_autopilot(True, tm.get_port())
-            tm.set_desired_speed(npc, config.vehicle.npc_target_speed_kmh)
             tm.auto_lane_change(npc, False)
             print("Spawned NPC in adjacent lane")
 

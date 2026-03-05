@@ -539,10 +539,16 @@ def _draw_route(world, alert, hero, traj):
             life_time=_DRAW_LT,
         )
 
-    # Draw every Nth segment to keep debug budget low
-    step = max(1, len(positions) // 200)
+    # Draw segments within a rolling proximity window so the route advances
+    # with the driver instead of being front-loaded at position 0 (where CARLA's
+    # render distance would hide everything further than ~50 m away).
+    DRAW_RADIUS = 150.0  # metres ahead/behind hero to render
+    step = max(1, len(positions) // 400)
     for i in range(0, len(positions) - step, step):
-        a, b = positions[i], positions[i + step]
+        a = positions[i]
+        if (a[0] - hloc.x) ** 2 + (a[1] - hloc.y) ** 2 > DRAW_RADIUS ** 2:
+            continue
+        b = positions[i + step]
         world.debug.draw_line(
             begin=carla.Location(x=a[0], y=a[1], z=a[2] + 0.3),
             end=carla.Location(  x=b[0], y=b[1], z=b[2] + 0.3),
@@ -723,17 +729,31 @@ def run_av_episode(
     config.next_map              = _SCENARIO_MAPS.get(scenario, "Town01")
     config.evaluate              = True
     config.client_port           = port
-    config.SPECATE               = False   # disables UE4 rendering (no_rendering_mode=True)
+    config.SPECATE                = True    # keep rendering ON so camera produces real images for the model
     config.waypoint_timeout_ticks = 10_000  # ~500 s at 20 FPS — lets AV finish full route
     config.NUM_TRAFFIC_VEHICLES   = 0       # no NPC traffic during AV phase
 
     _av_client = carla.Client("localhost", port)
     _av_client.set_timeout(30.0)
+
+    # Destroy any vehicles left over from calibration or a previous iteration
+    # before CarlaEnv resets the world, so the AV runs in a clean empty world.
+    _av_world = _av_client.get_world()
+    _leftover = list(_av_world.get_actors().filter("vehicle.*"))
+    if _leftover:
+        print(f"[av_run] Destroying {len(_leftover)} leftover vehicle(s) before AV start.")
+        for _a in _leftover:
+            _a.destroy()
+        _av_world.tick()
+
     env = CarlaEnv(_av_client, config)
 
     # Inject the calibrated style as fixed preference weights.
     # get_pref_weights_step() is called inside get_observation() every tick.
     _w = style_profile.astype(np.float32).copy()
+    # Floor the speed weight so the AV always drives at a normal pace regardless
+    # of how slowly the human drove during the short calibration phase.
+    _w[0] = max(float(_w[0]), 0.6)
     env.pref_weights_round    = _w
     env.get_pref_weights      = lambda: None      # no-op; preserves _w set above
     env.get_pref_weights_step = lambda: _w.copy()
@@ -752,11 +772,40 @@ def run_av_episode(
     total  = max(len(env.route), 1)
     print(f"[av_run] Environment reset. Route: {total} waypoints.")
 
+    # After the map loads, purge every vehicle and walker except the AV hero.
+    # This removes static parked-car props that are baked into the map and would
+    # cause false collision terminations.
+    _hero_id = env.vehicle.id
+    _av_world = env.world
+    _to_destroy = [
+        a for a in _av_world.get_actors()
+        if (a.type_id.startswith("vehicle.") or a.type_id.startswith("walker."))
+        and a.id != _hero_id
+    ]
+    if _to_destroy:
+        print(f"[av_run] Removing {len(_to_destroy)} static/NPC actor(s) from map.")
+        for _a in _to_destroy:
+            _a.destroy()
+        _av_world.tick()
+
     try:
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, _, done, _, info = env.step(action)
             sim_t += _DT
+
+            if done:
+                wp_now = steps[-1].wp_index if steps else 0
+                print(f"\n[av_run] *** EPISODE TERMINATED ***")
+                print(f"  sim_time          : {sim_t:.1f}s")
+                print(f"  waypoint          : {wp_now} / {total}  ({wp_now/total*100:.1f}%)")
+                print(f"  waypoint_logic    : {info.get('waypoint_logic_value', '?')}")
+                print(f"  collision         : {info.get('collision', '?')}")
+                print(f"  collision_type    : {info.get('collision_type', '?')}")
+                print(f"  timeout_flag      : {getattr(env, 'timeout', '?')}")
+                print(f"  timeout_ticks     : {getattr(env, 'timeout_ticks', '?')}")
+                print(f"  episode_ticks     : {getattr(env, 'episode_ticks', '?')}")
+                print(f"  collision_cnt     : {getattr(env, 'collision_cnt', '?')}")
 
             v    = env.vehicle
             tf   = v.get_transform()
@@ -811,10 +860,16 @@ def run_human_episode(
     print("Watch the CARLA UE4 window. Follow the route shown by the alert.")
     print(f"{'='*60}")
 
-    # Destroy any NPC vehicles left over from the AV phase before spawning hero.
-    for actor in world.get_actors().filter("vehicle.*"):  # type: ignore[union-attr]
-        actor.destroy()
-    print("[human_run] Cleared leftover traffic actors.")
+    # Wipe all vehicles and walkers before spawning hero so the map is empty.
+    _pre_clear = [
+        a for a in world.get_actors()
+        if a.type_id.startswith("vehicle.") or a.type_id.startswith("walker.")
+    ]
+    for _a in _pre_clear:
+        _a.destroy()
+    if _pre_clear:
+        world.tick()
+    print(f"[human_run] Cleared {len(_pre_clear)} actor(s) from map.")
 
     hero      = _spawn_hero(world)
     regressor = HumanStyleRegressor()
@@ -1049,17 +1104,19 @@ class AlertPipeline:
             _disconnect(world)
         print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
 
+        # Phase 1 — AV run once before the loop.  The same trajectory is reused
+        # for every iteration so each human run is compared against an identical
+        # reference, and the expensive AV episode is not repeated needlessly.
+        traj, av_steps = run_av_episode(
+            self.model_path, self.style_profile,
+            self.scenario, self.port,
+        )
+
         # Iteration loop
         for it in range(self.max_iterations):
             print(f"\n{'#'*60}")
             print(f"# ITERATION {it+1} / {self.max_iterations}")
             print(f"{'#'*60}")
-
-            # Phase 1 — headless AV run (CarlaEnv handles its own connection)
-            traj, av_steps = run_av_episode(
-                self.model_path, self.style_profile,
-                self.scenario, self.port,
-            )
 
             # Phase 2 — human run (direct connection, rendering ON)
             print(f"\n[pipeline] Re-enabling UE4 rendering for human run …")
