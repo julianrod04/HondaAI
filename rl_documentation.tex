@@ -13,6 +13,7 @@
 \maketitle
 
 \section{Introduction}
+\paragraph{}
 Below is a list of the processes used and lessons learned 
 as we trained our autonomous vehicle in CARLA. After explaining
 our choices and exactly what went right and wrong, we will 
@@ -22,11 +23,23 @@ on our experiences
 \section{What Went Wrong}
 
 \subsection{Custom PPO vs SB3}
+\paragraph{}
+
 \subsection{Driving Rules}
+\paragraph{}
 Our final car appeared to behave erratically at first, as though it wasn't
 properly obeying driving rules like staying in the speed limit or using the
-right lanes
-\paragraph{}
+right lanes. However, we realized this was because of the way CARLA was initialized.
+
+The speed limits in many of the CARLA maps change very abruptly, and often to unrealistic values.
+One example is in the city map, where the speed limit around a turn is 30 mph, but it quickly changes
+to 90 mph during the next straight segment. This makes the car appear to lurch forward. However, this
+is actually good behavior of the model, as it is trying to stay at near 95\% of the speed limit.
+
+Something similar happened with waypoints. The car will follow waypoints well, but if these
+points are not placed right, the car will seem break traffic rules. Overall, it is super important
+for later validation that the original simulation is made as accurate as possible, even details that
+might appear to be right on first glance.
 
 \subsection{?}
 \subsection{?}
@@ -53,7 +66,16 @@ output fluxuations. We found that keeping speed minimal and safety maximal led
 to the smoothest car. In the future, training might want to reduce the loss 
 related to the style vectors to make the model fluctuate less, ie. make the 
 style changes less extreme.
-\subsection{?}
+\subsection{PPO Alerts}
+\paragraph{}
+We initially wanted a small, parameterless model for the adaptive alert system. So, we used Gaussion Kernel Estimation to essentially
+weight the alert parameters by scores the system has achieved with them in the past. Then, the model will randomly sample near points
+with higher scores to get the alert values (with some room to explore). 
+
+Unfortunately, this converged much slower and with lower accuracy
+than having a gradient-based model. We chose PPO for our gradient model using the route difference between the AV and hero car as the loss, 
+using the typical PPO clipped loss. This converged well during simulation of multiple drivers.
+
 \subsection{?}
 \subsection{?}
 
