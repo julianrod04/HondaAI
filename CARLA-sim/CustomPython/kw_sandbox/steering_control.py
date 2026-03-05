@@ -1,6 +1,68 @@
 import carla
 import math
+import os
+import ctypes
 import pygame
+
+# ── FORCE FEEDBACK ─────────────────────────────────────────────────────────────
+# Overall FFB strength as a percentage (0 = off, 100 = full).
+# Lower this value to make the wheel feel looser / lighter.
+FFB_STRENGTH = 2    # very light — well below G920 default (~80-100)
+
+# Common install paths for the Logitech Steering Wheel SDK DLL.
+_LOGI_DLL_PATHS = [
+    r"C:\Program Files\Logitech\Gaming Software\SDKs\Steering Wheel\x64\LogitechSteeringWheelEnginesWrapper.dll",
+    r"C:\Program Files (x86)\Logitech\Gaming Software\SDKs\Steering Wheel\x64\LogitechSteeringWheelEnginesWrapper.dll",
+    r"C:\Program Files\LGHUB\sdk\Steering Wheel\x64\LogitechSteeringWheelEnginesWrapper.dll",
+]
+
+_logi_sdk = None
+
+def _load_logi_sdk():
+    for path in _LOGI_DLL_PATHS:
+        if os.path.exists(path):
+            try:
+                return ctypes.cdll.LoadLibrary(path)
+            except OSError:
+                pass
+    return None
+
+def ffb_init():
+    """Initialise the Logitech FFB SDK and apply FFB_STRENGTH.
+    Call once after pygame.joystick.init().  Safe no-op if SDK not found.
+    """
+    global _logi_sdk
+    _logi_sdk = _load_logi_sdk()
+    if _logi_sdk is None:
+        print("[ffb] Logitech SDK DLL not found — force feedback unchanged.")
+        return
+    try:
+        _logi_sdk.LogiSteeringInitialize(False)
+        # Spring effect: gives the centering / road-feel resistance.
+        # saturation=FFB_STRENGTH caps the max force; coefficient controls rate.
+        _logi_sdk.LogiPlaySpringForce(
+            0,              # device index
+            0,              # offset (centre at 0)
+            FFB_STRENGTH,   # saturation  (0-100)
+            FFB_STRENGTH,   # coefficient (0-100)
+        )
+        # Damper: smooths oscillations; keep proportional to spring.
+        _logi_sdk.LogiPlayDamperForce(0, FFB_STRENGTH // 2)
+        print(f"[ffb] Force feedback initialised at strength {FFB_STRENGTH}%.")
+    except Exception as exc:
+        print(f"[ffb] SDK call failed: {exc}")
+
+def ffb_shutdown():
+    """Stop all FFB effects and shut down the SDK.  Call on exit."""
+    if _logi_sdk is None:
+        return
+    try:
+        _logi_sdk.LogiStopSpringForce(0)
+        _logi_sdk.LogiStopDamperForce(0)
+        _logi_sdk.LogiSteeringShutdown()
+    except Exception:
+        pass
+
 
 def get_wheel_control(
     wheel,
@@ -28,37 +90,38 @@ def get_wheel_control(
     control.reverse = reverse_mode
 
     # ---- Steering (Axis 0) ----
-    steer_axis = wheel.get_axis(0)  # -1 left, +1 right
+    steer_axis = -wheel.get_axis(0)
+    steer_axis = -steer_axis   # invert: G920 left = +1 on Windows; flip so left = negative
     deadzone = 0.05
     if abs(steer_axis) < deadzone:
         steer_axis = 0.0
-    # Power curve: softens centre, full lock still reaches ±1.0
-    # Increase exponent for softer centre (2.0 = moderate, 3.0 = very soft)
-    steer_sensitivity = 2.5
+    # Power curve: softens centre response
+    # Higher exponent = softer centre (less sensitive at low/mid wheel angle)
+    steer_sensitivity = 1
     sign = 1.0 if steer_axis >= 0 else -1.0
     steer_axis = sign * (abs(steer_axis) ** steer_sensitivity)
+    # Scale down max steer so full wheel lock doesn't snap the wheels hard over
+    steer_axis *= 0.7
     control.steer = float(max(-1.0, min(1.0, steer_axis)))
     if debug:
         print(f"[wheel] steer={control.steer:.3f}")
 
     # ---- Accelerator (Axis 3) ----
-    accel_axis = wheel.get_axis(3)  # -1 rest, +1 pressed
-    # Map [-1, 1] -> [0, 1]
-    throttle = (accel_axis + 1.0) / 2.0
-    # Deadzone so pedal at rest reads exactly 0
-    if throttle < 0.05:
-        throttle = 0.0
-    control.throttle = float(max(0.0, min(1.0, throttle)))
+    # Use raw axis value as throttle (confirmed to give correct max speed at full press).
+    # Floor at IDLE_THROTTLE so the car creeps forward at rest, like a real car.
+    IDLE_THROTTLE = 0.20
+    accel_axis = wheel.get_axis(3)
+    control.throttle = float(max(IDLE_THROTTLE, min(1.0, accel_axis)))
     if debug:
         print(f"[wheel] throttle={control.throttle:.3f}")
 
     # ---- Brake (Axis 1) ----
     brake_axis = wheel.get_axis(1)  # -1 rest, +1 pressed
     brake_val = (brake_axis + 1.0) / 2.0
-    if brake_val < 0.05:
+    if brake_val < 0.15:   # wide deadzone so resting pedal never applies brake
         brake_val = 0.0
     # Gentle power curve: light tap = light brake, full press = full brake
-    brake_val = brake_val ** 1.5
+    brake_val = brake_val ** 3.0
     control.brake = float(max(0.0, min(1.0, brake_val)))
     if debug:
         print(f"[wheel] brake={control.brake:.3f}")
@@ -79,11 +142,11 @@ def get_keyboard_control(keys, control, reverse_mode: bool) -> carla.VehicleCont
 
     # Throttle (forward or reverse depending on control.reverse)
     if keys[pygame.K_w]:
-        control.throttle = 1.0
+        control.throttle = 0.5
 
     # Brake
     if keys[pygame.K_s]:
-        control.brake = 1.0
+        control.brake = 0.5
 
     # Steering
     steer_amt = 0.35

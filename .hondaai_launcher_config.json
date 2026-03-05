@@ -1,0 +1,11 @@
+{
+  "carla_root": "",
+  "venv_path": "",
+  "carla_port": 2000,
+  "carla_quality": "Low",
+  "carla_offscreen": false,
+  "carla_map": "Town10HD",
+  "auto_refresh": true,
+  "custom_scripts": [],
+  "custom_dirs": []
+}

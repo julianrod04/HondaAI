@@ -76,7 +76,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Constants — normalisation ranges matching the sb3 AV reward functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_BUFFER_SIZE = 500   # ticks (~8 s at 60 Hz, ~25 s at 20 Hz)
+DEFAULT_BUFFER_SIZE = 500_000   # large enough to hold every tick of any session;
+                                # ensures get_style_profile() is a true mean of ALL samples
 
 # Speed reward: Path C (normal driving) spans [-2.25, 1.75]
 _SPEED_REWARD_MIN =  -2.25
@@ -135,6 +136,10 @@ class HumanStyleRegressor:
     ) -> None:
         self._buffer: deque = deque(maxlen=buffer_size)
         self._cfg = config or Hyperparameters()
+        # Cumulative sum / count so the final profile is always the mean of
+        # every single sample collected, regardless of buffer_size.
+        self._cumsum: np.ndarray = np.zeros(STYLE_DIM, dtype=np.float64)
+        self._cumcount: int = 0
 
         # Previous-tick state required by aggressiveness() and comfort()
         self._prev_steering:         float = 0.0
@@ -258,7 +263,9 @@ class HumanStyleRegressor:
         ], dtype=np.float32)
 
         self._buffer.append(scores)
-        self._n_ticks += 1
+        self._cumsum   += scores.astype(np.float64)
+        self._cumcount += 1
+        self._n_ticks  += 1
 
         # ── Update previous-tick state ────────────────────────────────────────
         self._prev_steering         = steering
@@ -271,15 +278,18 @@ class HumanStyleRegressor:
         return scores
 
     def get_style_profile(self) -> np.ndarray:
-        """Return the mean style profile over the rolling buffer.
+        """Return the mean style profile over ALL samples ever collected.
+
+        Uses a cumulative sum/count so the result is always the true session
+        mean, not just the last window of the rolling buffer.
 
         Returns:
             np.ndarray shape (4,) dtype float32 in [0, 1].
             Returns [0.5, 0.5, 0.5, 0.5] before any ticks are observed.
         """
-        if not self._buffer:
+        if self._cumcount == 0:
             return np.full(STYLE_DIM, 0.5, dtype=np.float32)
-        return np.mean(np.stack(self._buffer), axis=0).astype(np.float32)
+        return (self._cumsum / self._cumcount).astype(np.float32)
 
     def get_stats(self) -> dict:
         """Return diagnostic statistics including the current style profile."""
@@ -296,6 +306,8 @@ class HumanStyleRegressor:
     def reset(self) -> None:
         """Clear the buffer (e.g., when a new driver takes the wheel)."""
         self._buffer.clear()
+        self._cumsum[:]  = 0.0
+        self._cumcount   = 0
         self._prev_steering         = 0.0
         self._prev_throttle         = 0.0
         self._prev_acc_longitudinal = 0.0

@@ -1166,15 +1166,15 @@ class CarlaEnv(gym.Env):
 		
 		# Check for scenario timeout
 		self.timeout = float(0)
+		_wp_timeout = getattr(self.config, 'waypoint_timeout_ticks', None) or 1000
 		if self.timeout_index != self.current_index:
 			self.timeout_index = self.current_index
 			self.timeout_ticks = 0
 		else:
 			self.timeout_ticks += 1
-			# If no new waypoint is reached within one third of the episode length, timeout
-			if self.timeout_ticks > int(self.config.MAX_TICKS_PER_EPISODE / 3) or self.timeout_ticks > 200:
-				done = True
-				self.timeout = float(1)
+		if self.timeout_ticks > int(self.config.MAX_TICKS_PER_EPISODE / 3) or self.timeout_ticks > _wp_timeout:
+			done = True
+			self.timeout = float(1)
 
 		# Add evaluation information and more logging calculations into info dictionary
 		info["baseline_reward"] = f"{baseline_reward:.3f}"

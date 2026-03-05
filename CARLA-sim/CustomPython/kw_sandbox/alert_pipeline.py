@@ -151,8 +151,8 @@ except ImportError:
     print("[init] CRITICAL: pygame not found. Install sb3/requirements.txt.")
 
 # ── PROJECT IMPORTS ───────────────────────────────────────────────────────────
-from steering_control import get_wheel_control, get_keyboard_control  # noqa: E402
-from alert_models import AlertVector, MoEAlertModel, DEFAULT_STATE_DIM  # noqa: E402
+from steering_control import get_wheel_control, get_keyboard_control, ffb_init, ffb_shutdown  # noqa: E402
+from alert_models import AlertVector, MoEAlertModel, DEFAULT_STATE_DIM, MAX_LAG  # noqa: E402
 from carla_alert_output import AVTrajectory, _play_direction  # noqa: E402
 from human_style_regression import HumanStyleRegressor  # noqa: E402
 
@@ -296,12 +296,17 @@ class ControlReader:
             self._wheel.init()
             print(f"[input] Steering wheel detected: {self._wheel.get_name()}")
             print("[input]   Axis 0 = steering | Axis 1 = brake | Axis 3 = throttle")
+            ffb_init()
         else:
             print("[input] No wheel detected — keyboard fallback (W/A/S/D).")
 
         self._control     = carla.VehicleControl()
         self._reverse     = False
         self.quit_request = False
+
+    @property
+    def reverse(self) -> bool:
+        return self._reverse
 
     def read(self) -> carla.VehicleControl:
         """Process events and return the current VehicleControl."""
@@ -314,6 +319,10 @@ class ControlReader:
                     print(f"[input] Reverse: {self._reverse}")
                 if ev.key == pygame.K_q:
                     self.quit_request = True
+            # G920 wheel: button 8 (left paddle shifter) toggles reverse
+            if ev.type == pygame.JOYBUTTONDOWN and ev.button == 8:
+                self._reverse = not self._reverse
+                print(f"[input] Reverse (wheel button 8): {self._reverse}")
 
         if self._wheel is not None:
             get_wheel_control(self._wheel, self._control, self._reverse)
@@ -324,6 +333,7 @@ class ControlReader:
         return self._control
 
     def close(self) -> None:
+        ffb_shutdown()
         pygame.quit()
 
 
@@ -368,26 +378,41 @@ def _disconnect(world: object) -> None:
 def _spectator_follow(world: object, vehicle: object) -> None:
     tf  = vehicle.get_transform()  # type: ignore[union-attr]
     yaw = math.radians(tf.rotation.yaw)
+
+    # Compensate for 1-tick rendering lag: predict where the car will be next tick
+    # so the camera stays locked to the seat rather than drifting back at speed.
+    vel = vehicle.get_velocity()  # type: ignore[union-attr]
+    pred_x = tf.location.x + vel.x * _DT
+    pred_y = tf.location.y + vel.y * _DT
+    pred_z = tf.location.z + vel.z * _DT
+
+    # Driver's seat: 0.3 m forward + 0.35 m to the RIGHT in world space
+    # (vehicle local +Y is right; in world: right = (sin yaw, -cos yaw)).
+    # Previous code used (-sin, +cos) which landed on the passenger side — flip here.
+    fwd_offset   = 0.3
+    right_offset = 0.35  # positive = driver's right = physically left of car centre (LHD)
     world.get_spectator().set_transform(carla.Transform(  # type: ignore[union-attr]
         carla.Location(
-            x=tf.location.x - 8.0 * math.cos(yaw),
-            y=tf.location.y - 8.0 * math.sin(yaw),
-            z=tf.location.z + 4.0,
+            x=pred_x + fwd_offset * math.cos(yaw) + right_offset * math.sin(yaw),
+            y=pred_y + fwd_offset * math.sin(yaw) - right_offset * math.cos(yaw),
+            z=pred_z + 1.3,
         ),
-        carla.Rotation(pitch=-15.0, yaw=tf.rotation.yaw),
+        carla.Rotation(pitch=0.0, yaw=tf.rotation.yaw, roll=0.0),
     ))
 
 
 def _spawn_hero(world: object, spawn_index: int = 8) -> object:
-    bp  = world.get_blueprint_library().find("vehicle.dodge.charger_2020")  # type: ignore[union-attr]
+    bp  = world.get_blueprint_library().find("vehicle.lincoln.mkz_2020")  # type: ignore[union-attr]
     bp.set_attribute("role_name", "hero")
     pts = world.get_map().get_spawn_points()  # type: ignore[union-attr]
-    idx = spawn_index % len(pts)
-    v   = world.try_spawn_actor(bp, pts[idx])  # type: ignore[union-attr]
-    if v is None:
-        raise RuntimeError(f"Could not spawn hero at spawn point {idx}.")
-    print(f"[spawn] Hero spawned at spawn point {idx}.")
-    return v
+    # Try the preferred index first, then walk through all points until one is free.
+    indices = [spawn_index % len(pts)] + [i for i in range(len(pts)) if i != spawn_index % len(pts)]
+    for idx in indices:
+        v = world.try_spawn_actor(bp, pts[idx])  # type: ignore[union-attr]
+        if v is not None:
+            print(f"[spawn] Hero spawned at spawn point {idx}.")
+            return v
+    raise RuntimeError("Could not spawn hero at any spawn point — all occupied.")
 
 
 # ── DEBUG ALERT DRAWING (CARLA UE4 WINDOW) ───────────────────────────────────
@@ -428,24 +453,60 @@ def draw_alert(
 
 
 def _draw_arrow(world, alert, hero, traj, sim_time):
-    target = traj.get_position_at(sim_time + alert.lag)
+    # Look up where the AV will be lag seconds from now — NOT its current position.
+    look_ahead_t = sim_time + alert.lag
+    target = traj.get_position_at(look_ahead_t)
     if target is None:
         return
 
     scale    = float(alert.gui_params[0])
-    opacity  = float(alert.gui_params[1])
     vib_dist = float(alert.gui_params[2]) * _MAX_DIST_M
 
     hloc = hero.get_location()
+    htf  = hero.get_transform()
+    yaw  = math.radians(htf.rotation.yaw)
+
+    # Distance to AV for color
     dist = math.sqrt((target[0] - hloc.x)**2 + (target[1] - hloc.y)**2)
     color = _dist_color(dist, bool(alert.color))
 
+    # Windshield anchor: 1.3 m ahead of driver, at eye height
+    ws_x      = hloc.x + 1.3 * math.cos(yaw)
+    ws_y      = hloc.y + 1.3 * math.sin(yaw)
+    ws_z      = hloc.z + 1.25   # windshield centre height
+
+    # ── Clock-hand direction ──────────────────────────────────────────────────
+    # Project the hero→AV horizontal vector onto the driver's frame:
+    #   forward component → vertical on windshield (up = AV ahead, down = AV behind)
+    #   lateral component → horizontal on windshield (right = AV to the right)
+    fwd_x  =  math.cos(yaw)   # vehicle forward in world X
+    fwd_y  =  math.sin(yaw)   # vehicle forward in world Y
+    right_x =  math.sin(yaw)  # vehicle right in world X
+    right_y = -math.cos(yaw)  # vehicle right in world Y
+
+    dx = target[0] - hloc.x
+    dy = target[1] - hloc.y
+
+    forward_comp = dx * fwd_x   + dy * fwd_y    # + = AV is ahead  → arrow up
+    lateral_comp = dx * right_x + dy * right_y  # + = AV is right  → arrow right
+
+    mag = math.sqrt(forward_comp ** 2 + lateral_comp ** 2) + 1e-6
+    fwd_n = forward_comp / mag
+    lat_n = lateral_comp / mag
+
+    arm = 0.12 + scale * 0.04   # clock-hand length in metres (small)
+
+    tip_x = ws_x + lat_n * right_x * arm   # left/right offset on windshield
+    tip_y = ws_y + lat_n * right_y * arm
+    tip_z = ws_z + fwd_n * arm              # up if AV ahead, down if AV behind
+
+    # Thin, non-glowing, very transparent — no glow
     world.debug.draw_arrow(
-        begin=carla.Location(x=hloc.x, y=hloc.y, z=hloc.z + 1.5),
-        end=carla.Location(  x=target[0], y=target[1], z=target[2] + 1.5),
-        thickness=max(0.03, 0.03 + scale * 0.15) * opacity,
-        arrow_size=max(0.15, 0.15 + scale * 0.35),
-        color=_carla_rgb(color),
+        begin=carla.Location(x=ws_x, y=ws_y, z=ws_z),
+        end=carla.Location(  x=tip_x, y=tip_y, z=tip_z),
+        thickness=0.010,
+        arrow_size=0.04,
+        color=carla.Color(r=color[0], g=color[1], b=color[2], a=12),
         life_time=_DRAW_LT,
     )
     if bool(alert.vibration) and dist > vib_dist:
@@ -462,7 +523,7 @@ def _draw_route(world, alert, hero, traj):
     if len(positions) < 2:
         return
 
-    line_w   = max(0.03, float(alert.gui_params[0]) * 0.2)
+    line_w   = max(0.09, float(alert.gui_params[0]) * 0.2)  # min 3× original 0.03
     opacity  = float(alert.gui_params[1])
     vib_dist = float(alert.gui_params[2]) * _MAX_DIST_M
 
@@ -493,8 +554,8 @@ def _draw_route(world, alert, hero, traj):
 
 def _tick_sound(alert, hero, traj, sim_time):
     global _last_sound_t
-    lat_thresh = float(alert.gui_params[0]) * 10.0   # [0,1] → [0,10] m
-    cooldown   = float(alert.gui_params[1]) * 10.0   # [0,1] → [0,10] s
+    lat_thresh = float(alert.gui_params[0]) * 10.0    # [0,1] → [0,10] m
+    cooldown   = float(alert.gui_params[1]) * 150.0  # [0,1] → [0,150] s (15× reduction)
     volume     = float(alert.gui_params[2])
 
     if sim_time - _last_sound_t < cooldown:
@@ -583,6 +644,7 @@ def run_calibration(
     print("[calibration] Collision sensor attached.")
 
     ctrl_reader = ControlReader()
+    clock   = pygame.time.Clock()
     tick = 0
     start_t = time.time()
 
@@ -597,15 +659,21 @@ def run_calibration(
             ctrl = ctrl_reader.read()
             hero.apply_control(ctrl)
             world.tick()
+            clock.tick(FPS)   # cap to FPS so sim time ≈ real time
 
             profile = regressor.tick(hero, world, _DT)
             _spectator_follow(world, hero)
 
-            # Draw HUD as floating text above hero in UE4 window
+            # Draw HUD on the windshield (same plane as the arrow)
             loc = hero.get_location()
+            htf = hero.get_transform()
+            _yaw = math.radians(htf.rotation.yaw)
+            ws_x = loc.x + 1.3 * math.cos(_yaw)
+            ws_y = loc.y + 1.3 * math.sin(_yaw)
+            rev_tag = "  [REVERSE]" if ctrl_reader.reverse else ""
             world.debug.draw_string(
-                location=carla.Location(x=loc.x, y=loc.y, z=loc.z + 3.5),
-                text=(f"CALIBRATION  {remaining}s  |  "
+                location=carla.Location(x=ws_x, y=ws_y, z=loc.z + 1.45),
+                text=(f"CAL {remaining}s{rev_tag} | "
                       + "  ".join(f"{l[0]}:{v:.2f}"
                                   for l, v in zip(STYLE_LABELS, profile))),
                 color=carla.Color(r=220, g=220, b=220),
@@ -650,14 +718,18 @@ def run_av_episode(
     print("         UE4 window will go dark — this is normal.")
     print(f"{'='*60}")
 
-    config             = Hyperparameters()
-    config.scenario    = scenario
-    config.next_map    = _SCENARIO_MAPS.get(scenario, "Town01")
-    config.evaluate    = True
-    config.client_port = port
-    config.SPECATE     = False   # disables UE4 rendering (no_rendering_mode=True)
+    config                       = Hyperparameters()
+    config.scenario              = scenario
+    config.next_map              = _SCENARIO_MAPS.get(scenario, "Town01")
+    config.evaluate              = True
+    config.client_port           = port
+    config.SPECATE               = False   # disables UE4 rendering (no_rendering_mode=True)
+    config.waypoint_timeout_ticks = 10_000  # ~500 s at 20 FPS — lets AV finish full route
+    config.NUM_TRAFFIC_VEHICLES   = 0       # no NPC traffic during AV phase
 
-    env = CarlaEnv(config)
+    _av_client = carla.Client("localhost", port)
+    _av_client.set_timeout(30.0)
+    env = CarlaEnv(_av_client, config)
 
     # Inject the calibrated style as fixed preference weights.
     # get_pref_weights_step() is called inside get_observation() every tick.
@@ -726,6 +798,7 @@ def run_human_episode(
     av_style:     np.ndarray,
     alert_model:  MoEAlertModel,
     max_duration: float = 300.0,
+    force_arrow:  bool  = False,
 ) -> List[HumanStepData]:
     """Human drives with alert overlays drawn into the UE4 window.
 
@@ -737,6 +810,11 @@ def run_human_episode(
     print(f"PHASE 2  HUMAN RUN WITH ALERTS  (max {int(max_duration)}s)")
     print("Watch the CARLA UE4 window. Follow the route shown by the alert.")
     print(f"{'='*60}")
+
+    # Destroy any NPC vehicles left over from the AV phase before spawning hero.
+    for actor in world.get_actors().filter("vehicle.*"):  # type: ignore[union-attr]
+        actor.destroy()
+    print("[human_run] Cleared leftover traffic actors.")
 
     hero      = _spawn_hero(world)
     regressor = HumanStyleRegressor()
@@ -750,6 +828,13 @@ def run_human_episode(
     init_meas = CarlaEnvUtils.get_vehicle_measurements(hero)
     init_state = _build_state(hero, init_meas, first_av, 0.0, 0.0)
     alert, log_prob = alert_model.sample(init_state)
+    if force_arrow:
+        alert.gui_type   = 0
+        alert.gui_params = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        # Guarantee a visible lag so the arrow shows a future position, not the
+        # AV's current position.  Clamp to MAX_LAG in case the model went high.
+        alert.lag = float(np.clip(max(alert.lag, 1.0), 0.0, MAX_LAG))
+        print(f"[human_run] force_arrow=True — gui_type=arrow, lag={alert.lag:.2f}s")
     alert_raw = alert.to_raw()
 
     print(f"\n[human_run] ── Episode alert (FIXED for this run) ──────────────")
@@ -768,13 +853,14 @@ def run_human_episode(
 
     av_end_t    = av_steps[-1].sim_time if av_steps else max_duration
     ctrl_reader = ControlReader()
+    clock       = pygame.time.Clock()
     step_log: List[HumanStepData] = []
     sim_t = 0.0
     tick  = 0
 
     try:
         while True:
-            if sim_t >= min(max_duration, av_end_t):
+            if sim_t >= max(max_duration, av_end_t):
                 print(f"[human_run] Episode duration reached ({sim_t:.1f}s).")
                 break
             if ctrl_reader.quit_request:
@@ -784,6 +870,7 @@ def run_human_episode(
             ctrl = ctrl_reader.read()
             hero.apply_control(ctrl)
             world.tick()
+            clock.tick(FPS)   # cap to FPS so sim time ≈ real time
             sim_t += _DT
             tick  += 1
 
@@ -892,7 +979,7 @@ class AlertPipeline:
         self,
         model_path:           str,
         scenario:             str  = "intersection",
-        calibration_duration: int  = 120,
+        calibration_duration: int  = 20,
         max_iterations:       int  = 20,
         host:                 str  = "localhost",
         port:                 int  = 2000,
@@ -951,17 +1038,16 @@ class AlertPipeline:
     def run(self) -> None:
         target_map = _SCENARIO_MAPS.get(self.scenario, "Town01")
 
-        # Phase 0 — calibration (once per session)
-        if not self._load_style():
-            print(f"\n[pipeline] Starting calibration (map={target_map}) …")
-            client, world = _connect(self.host, self.port, render=True)
-            world = _load_map(client, world, target_map)
-            try:
-                self.style_profile = run_calibration(
-                    client, world, self.calibration_duration)
-            finally:
-                _disconnect(world)
-            print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
+        # Phase 0 — calibration (always run, never skipped)
+        print(f"\n[pipeline] Starting calibration (map={target_map}) …")
+        client, world = _connect(self.host, self.port, render=True)
+        world = _load_map(client, world, target_map)
+        try:
+            self.style_profile = run_calibration(
+                client, world, self.calibration_duration)
+        finally:
+            _disconnect(world)
+        print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
 
         # Iteration loop
         for it in range(self.max_iterations):
@@ -983,6 +1069,7 @@ class AlertPipeline:
                 step_log = run_human_episode(
                     client, world, traj, av_steps,
                     self.style_profile, self.alert_model,
+                    force_arrow=(it == 0),
                 )
             finally:
                 _disconnect(world)
@@ -1081,7 +1168,7 @@ def main() -> None:
                         f"{_RUN_ROOT}")
     p.add_argument("--scenario", default="intersection",
                    choices=list(_SCENARIO_MAPS.keys()))
-    p.add_argument("--calibration-duration", type=int, default=120,
+    p.add_argument("--calibration-duration", type=int, default=20,
                    help="Calibration free-drive duration in seconds")
     p.add_argument("--max-iterations", type=int, default=20)
     p.add_argument("--host", default="localhost")
