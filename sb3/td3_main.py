@@ -79,39 +79,47 @@ if __name__ == "__main__":
 		# Wrap the environment to make it vectorized for SB3 compatibility
 		env = DummyVecEnv([lambda: env])
 
-		# Initialize the PD-MORL TD3 model
-		model = PDMORL_TD3(
-			CustomMultiInputPolicy,
-			env,
-			policy_kwargs=dict(
-				net_arch=[250, 125],  # Network architecture
-				# net_arch=[256, 128, 64],  # Alternative architecture
-				features_extractor_class=CustomCombinedExtractor,
-				features_extractor_kwargs={},  # Extra kwargs for the feature extractor
-				normalize_images=True,  # Enable image normalization
-				share_features_extractor=True,  # Share feature extractor between actor and critic
-				# activation_fn=nn.LeakyReLU,  # Optional activation function
-			),
-			replay_buffer_class=PDMORL_DictReplayBuffer,
+		# Initialize the PD-MORL TD3 model (from scratch or from pretrained weights)
+		if config.pretrained_model_path:
+			print(f"Loading pretrained model from: {config.pretrained_model_path}")
+			model = PDMORL_TD3.load(
+				config.pretrained_model_path,
+				env=env,
+				verbose=config.verbose,
+			)
+			print("Pretrained model loaded.")
+		else:
+			model = PDMORL_TD3(
+				CustomMultiInputPolicy,
+				env,
+				policy_kwargs=dict(
+					net_arch=[250, 125],  # Network architecture
+					# net_arch=[256, 128, 64],  # Alternative architecture
+					features_extractor_class=CustomCombinedExtractor,
+					features_extractor_kwargs={},  # Extra kwargs for the feature extractor
+					normalize_images=True,  # Enable image normalization
+					share_features_extractor=True,  # Share feature extractor between actor and critic
+					# activation_fn=nn.LeakyReLU,  # Optional activation function
+				),
+				replay_buffer_class=PDMORL_DictReplayBuffer,
 
-
-			#changed buffer size for memory allocation error
-			buffer_size=config.REPLAY_BUFFER_SIZE // 2,
-			learning_starts=100,
-			batch_size=config.BATCH_SIZE,
-			tau=config.tau,
-			gamma=config.discount,
-			train_freq=4,
-			action_noise=NormalActionNoise(
-				mean=np.array([0, 0.3]),
-				sigma=np.array([0.1, 0.2]),
-				dtype=np.float32
-			),  # Initial action noise, will be overwritten later
-			target_policy_noise=config.policy_noise,
-			target_noise_clip=config.noise_clip,
-			verbose=config.verbose,
-			_init_setup_model=True,
-		)
+				#changed buffer size for memory allocation error
+				buffer_size=config.REPLAY_BUFFER_SIZE // 2,
+				learning_starts=100,
+				batch_size=config.BATCH_SIZE,
+				tau=config.tau,
+				gamma=config.discount,
+				train_freq=4,
+				action_noise=NormalActionNoise(
+					mean=np.array([0, 0.3]),
+					sigma=np.array([0.1, 0.2]),
+					dtype=np.float32
+				),  # Initial action noise, will be overwritten later
+				target_policy_noise=config.policy_noise,
+				target_noise_clip=config.noise_clip,
+				verbose=config.verbose,
+				_init_setup_model=True,
+			)
 
 		# Load configuration into the model
 		model.load_config(config)
@@ -167,7 +175,7 @@ if __name__ == "__main__":
 
 	if evaluate_model:
 		# Path to the pretrained model for evaluation
-		model_path = "../run/pdmorl_Train_Session_2-16-2026_bestCombined.zip"
+		model_path = "../run/pdmorl_Train_Session_2-16-2026_bestCombined"
 
 		# Small delays to ensure environment and resources are ready
 		time.sleep(5)

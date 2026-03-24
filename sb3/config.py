@@ -33,10 +33,12 @@ class Hyperparameters:
 		self.fps = 20
 
 		# Scenario settings
+		self.pretrained_model_path = ""  # Path to pretrained model for fine-tuning. Empty string = train from scratch.
+
 		self.scenario = False # Can be: "intersection", "traffic_low", "traffic_high", "tunnel", "roundabout", "highway", "crossing", etc.
 		self.scenario_traffic = True  # Enable spawning traffic in scenarios
-		self.evaluate_scenarios = True  # Evaluate agent on predefined scenarios
-		self.training_scenarios = []  # List of scenario names to train on (e.g. ["intersection", "highway", "highway_50mph"]). Empty = random town training.
+		self.evaluate_scenarios = False  # Evaluate agent on predefined scenarios
+		self.training_scenarios = ["highway_50mph"]  # List of scenario names to train on (e.g. ["intersection", "highway", "highway_50mph"]). Empty = random town training.
 
 		# Reward parameters
 		self.target_speed_perc = 0.95
@@ -45,7 +47,7 @@ class Hyperparameters:
 		self.verbose = 0
 		self.tm_port = 8000  # Traffic manager port; can be overwritten
 		self.client_port = 2000  # CARLA client port; can be overwritten
-		self.evaluate = True  # Train or evaluate the agent
+		self.evaluate = False  # Train or evaluate the agent
 		self.showPolicy = True  # Evaluate policy performance with multiple weight samples
 		self.SPECATE = False  # Spectator follows the car; set False if rendering off-screen
 		self.next_map = 'Town04'  # Initial map
