@@ -48,6 +48,10 @@ class MyCallback(BaseCallback):
 		Called at each training step. Switches the town periodically
 		to expose the agent to different maps during training.
 		"""
+		# Skip town cycling when training on specific scenarios (scenarios manage the map)
+		if self.config.training_scenarios:
+			return True
+
 		# Switch town every `map_explore` steps after the key steps phase
 		if (self.n_calls + 2300) % self.map_explore == 0 and self.n_calls > self.config.key_steps:
 			# Select next town from the list

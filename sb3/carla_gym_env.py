@@ -235,9 +235,8 @@ class CarlaEnv(gym.Env):
 			# Get all living actors
 			all_actors = self.world.get_actors()
 
-			# Create the vehicle and traffic in some randomly designed urban scenarios
-			if self.config.scenario:
-				scenarios = [
+			# Scenarios list (used for evaluation mode and scenario-based training)
+			scenarios = [
 				{
 					"name": "Test1",
 					"map": "Town01",
@@ -305,11 +304,11 @@ class CarlaEnv(gym.Env):
 					"name": "highway",
 					"map": "Town04",
 					"seed": 582013,
-					"tm_seed": 582013, 
+					"tm_seed": 582013,
 					"max_waypoints": 800,
 					"spawnpoint": 9,
 					"traffic_spawnpoints": (2, 6, 7, 8, 12, 13, 19, 22, 37, 43, 46, 47, 49, 50, 54, 56, 61, 64, 70, 72, 84, 86, 98, 104, 105, 108, 111, 114, 120, 121, 123, 207)
-				},			
+				},
 				{
 					"name": "crossing",
 					"map": "Town04",
@@ -319,9 +318,25 @@ class CarlaEnv(gym.Env):
 					"spawnpoint": 166,
 					"traffic_spawnpoints": (251, 252, 250, 254, 247, 248, 249, 230, 231, 232, 233, 182, 183, 162, 164, 177, 178, 170, 195, 192, 261, 192)
 				},
-				]
+				{
+					# Two-lane highway cruise: hero targets 50 mph, NPC cars at 45-55 mph.
+					# Town04 highway speed limit ~90 km/h (56 mph).
+					# traffic_speed_range (2, 20) -> NPCs run 2%-20% below limit (~45-55 mph).
+					# target_speed_perc 0.893 -> hero targets ~50 mph (80.5/90 km/h).
+					"name": "highway_50mph",
+					"map": "Town04",
+					"seed": 112233,
+					"tm_seed": 112233,
+					"max_waypoints": 800,
+					"spawnpoint": 9,
+					"target_speed_perc": 0.893,
+					"traffic_speed_range": (2, 20),
+					"traffic_spawnpoints": (2, 6, 7, 8, 12, 13, 19, 22, 37, 43, 46, 47, 49, 50, 54, 56, 61, 64, 70, 72, 84, 86, 98, 104, 105, 108, 111, 114, 120, 121, 123, 207)
+				},
+			]
 
-				# Processing the scenario
+			if self.config.scenario:
+				# Evaluation mode: use fixed scenario config
 				found_scenario = False
 				for scenario in scenarios:
 					if self.config.scenario == scenario["name"]:
@@ -340,11 +355,36 @@ class CarlaEnv(gym.Env):
 				if not found_scenario:
 					print("Scenario not found!")
 					exit(-1)
-			else:
-				# normal training
-				self.config.seed = np.random.randint(1, 100000)
-				self.create_vehicle(spawnpoint=-1) 
 
+			elif self.config.training_scenarios:
+				# Scenario-based training: pick a random scenario each episode
+				scenario_name = np.random.choice(self.config.training_scenarios)
+				scenario = next((s for s in scenarios if s["name"] == scenario_name), None)
+				if scenario is None:
+					print(f"Training scenario '{scenario_name}' not found!")
+					exit(-1)
+				# Reload map if the selected scenario requires a different town
+				if self.config.next_map != scenario["map"]:
+					self.config.next_map = scenario["map"]
+					self.reload_map()
+				# Apply per-scenario target speed if specified, else keep config default
+				if "target_speed_perc" in scenario:
+					self.config.target_speed_perc = scenario["target_speed_perc"]
+				# Random seed for episode variety
+				self.config.seed = np.random.randint(1, 100000)
+				self.config.max_waypoints = scenario["max_waypoints"]
+				self.tm.set_random_device_seed(np.random.randint(1, 100000))
+				self.create_vehicle(spawnpoint=scenario["spawnpoint"])
+				if self.config.scenario_traffic:
+					if "traffic_speed_range" in scenario:
+						self.create_traffic_scenario_varied_speed(scenario["traffic_spawnpoints"], scenario["traffic_speed_range"])
+					else:
+						self.create_traffic_scenario(scenario["traffic_spawnpoints"])
+
+			else:
+				# Normal training: random spawn across current town
+				self.config.seed = np.random.randint(1, 100000)
+				self.create_vehicle(spawnpoint=-1)
 				self.create_traffic()
 
 			# create the route
@@ -594,6 +634,29 @@ class CarlaEnv(gym.Env):
 		self.tm.global_percentage_speed_difference((1 - npc_speed_perc) * 100)  # Geschwindigkeit anpassen
 		if stop:
 			self.tm.global_percentage_speed_difference(90) #stehen
+
+	def create_traffic_scenario_varied_speed(self, spawnpoints, speed_perc_range):
+		"""Spawn traffic with per-vehicle randomized speed.
+		speed_perc_range: (min_pct, max_pct) where values are % slower than speed limit
+		(e.g. (2, 20) -> NPCs drive 2%-20% below speed limit)
+		"""
+		available_spawn_points = self.available_spawn_points
+		blueprint = self.bp_lib.find('vehicle.ford.mustang')
+		spawned_npcs = []
+		for position in spawnpoints:
+			if available_spawn_points:
+				pos = int(position) % len(available_spawn_points)
+				spawn_point = available_spawn_points[pos]
+				npc = self.world.try_spawn_actor(blueprint, spawn_point)
+				if npc is not None:
+					self.tm.auto_lane_change(npc, True)
+					self.tm.set_global_distance_to_leading_vehicle(2.5)
+					self.actor_list.append(npc)
+					self.traffic_list.append(npc)
+					spawned_npcs.append(npc)
+		for npc in spawned_npcs:
+			speed_diff = float(np.random.uniform(speed_perc_range[0], speed_perc_range[1]))
+			self.tm.vehicle_percentage_speed_difference(npc, speed_diff)
 
 	def get_image_from_queue(self):
 		# Check if images are available in the queue before processing

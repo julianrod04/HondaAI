@@ -36,6 +36,7 @@ class Hyperparameters:
 		self.scenario = False # Can be: "intersection", "traffic_low", "traffic_high", "tunnel", "roundabout", "highway", "crossing", etc.
 		self.scenario_traffic = True  # Enable spawning traffic in scenarios
 		self.evaluate_scenarios = True  # Evaluate agent on predefined scenarios
+		self.training_scenarios = []  # List of scenario names to train on (e.g. ["intersection", "highway", "highway_50mph"]). Empty = random town training.
 
 		# Reward parameters
 		self.target_speed_perc = 0.95
