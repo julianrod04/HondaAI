@@ -1,0 +1,47 @@
+{
+  "os":  "Windows-10-10.0.26200-SP0",
+  "python":  "3.10.11",
+  "startedAt":  "2026-03-30T04:25:27.783358Z",
+  "args":  [
+    "--run=FineTune_Highway",
+    "--client_port=2000",
+    "--tm_port=8000"
+  ],
+  "program":  "C:\\Users\\jdr5622\\ECE 464H\\HondaAI\\sb3\\td3_main.py",
+  "codePath":  "sb3\\td3_main.py",
+  "git":  {
+    "remote":  "https://github.com/julianrod04/HondaAI.git",
+    "commit":  "4aceffc20f9f38f960ced2435b00c05863bb57df"
+  },
+  "email":  "juliandrodriguez04@gmail.com",
+  "root":  "C:\\Users\\jdr5622\\ECE 464H\\HondaAI",
+  "host":  "ECEN-A76568",
+  "username":  "jdr5622",
+  "executable":  "C:\\Users\\jdr5622\\ECE 464H\\HondaAI\\venv\\Scripts\\python.exe",
+  "codePathLocal":  "sb3\\td3_main.py",
+  "cpu_count":  20,
+  "cpu_count_logical":  20,
+  "gpu":  "NVIDIA GeForce RTX 5080",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1023312654336",
+      "used":  "721621540864"
+    }
+  },
+  "memory":  {
+    "total":  "33682501632"
+  },
+  "cpu":  {
+    "count":  20,
+    "countLogical":  20
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 5080",
+      "memoryTotal":  "17094934528",
+      "cudaCores":  10752
+    }
+  ],
+  "cudaVersion":  "13.0"
+}

@@ -80,16 +80,7 @@ if __name__ == "__main__":
 		env = DummyVecEnv([lambda: env])
 
 		# Initialize the PD-MORL TD3 model (from scratch or from pretrained weights)
-		if config.pretrained_model_path:
-			print(f"Loading pretrained model from: {config.pretrained_model_path}")
-			model = PDMORL_TD3.load(
-				config.pretrained_model_path,
-				env=env,
-				verbose=config.verbose,
-			)
-			print("Pretrained model loaded.")
-		else:
-			model = PDMORL_TD3(
+		model = PDMORL_TD3(
 				CustomMultiInputPolicy,
 				env,
 				policy_kwargs=dict(
@@ -120,6 +111,10 @@ if __name__ == "__main__":
 				verbose=config.verbose,
 				_init_setup_model=True,
 			)
+		if config.pretrained_model_path:
+			print(f"Loading pretrained model from: {config.pretrained_model_path}")
+			model.set_parameters(config.pretrained_model_path)
+			print("Pretrained weights loaded.")
 
 		# Load configuration into the model
 		model.load_config(config)
