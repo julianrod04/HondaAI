@@ -170,7 +170,7 @@ if __name__ == "__main__":
 
 	if evaluate_model:
 		# Path to the pretrained model for evaluation
-		model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "run", "pdmorl_Train_Session_2-16-2026_bestCombined")
+		model_path = r"C:\Users\bc35638\Documents\Alert_Test\HondaAI\run\pdmorl_Train_Session_2-16-2026_bestCombined"
 
 		# Small delays to ensure environment and resources are ready
 		time.sleep(5)
@@ -306,7 +306,8 @@ if __name__ == "__main__":
 				time.sleep(1)
 
 			# Path to save evaluation results
-			results_file_path = "eval_results/" + model_name + ".csv"
+			results_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_results", model_name + ".csv")
+			os.makedirs(os.path.dirname(results_file_path), exist_ok=True)
 			existing_results = load_existing_results(results_file_path)
 
 			# Define scenarios for evaluation
@@ -348,18 +349,18 @@ if __name__ == "__main__":
 				weights = np.round(
 					model.generate_eval_weights(step_size=0.125, reward_size=config.num_rewards, samples=12), 3
 				)
-				weights = [[0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1],
-			   [0.0, 0.0, 0.0, 1]]
+				weights = [[1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0],
+			   [1.0, 0.0, 0.0, 0.0]]
 				print(f"Evaluating {len(weights)} episodes for scenario: {scenario}")
 
 				# Metrics to accumulate results
@@ -400,7 +401,8 @@ if __name__ == "__main__":
 							_speed_print_time = _now
 							_vel = env.envs[0].vehicle.get_velocity()
 							_speed = (_vel.x**2 + _vel.y**2 + _vel.z**2) ** 0.5
-							print(f"AV Speed: {_speed:.2f} m/s")
+							_limit_kmh = env.envs[0].vehicle.get_speed_limit()
+							print(f"AV Speed: {_speed * 3.6:.1f} km/h  (limit: {_limit_kmh:.0f} km/h)")
 
 						# Unpack info and rewards for easier access
 						info = info[0]
@@ -526,5 +528,5 @@ if __name__ == "__main__":
 			# Save final results with means included
 			df_final_results.to_csv(results_file_path, index=False)
 			print("Mean and mean-of-std results added to the CSV file.")
-			exit(-1)
+			exit(0)
 			

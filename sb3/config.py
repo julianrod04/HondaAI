@@ -14,11 +14,11 @@ class Hyperparameters:
 		self.camera_shape = (self.NUM_CHANNELS, self.state_frames, self.IM_HEIGHT, self.IM_WIDTH)
 
 		# CARLA simulation parameters
-		self.MAX_TICKS_PER_EPISODE = 10000000
+		self.MAX_TICKS_PER_EPISODE = 1400
 		self.NUM_TRAFFIC_VEHICLES = 25  # Can be increased during training for realism
-		self.max_waypoints = 50000
+		self.max_waypoints = 500
 		self.inter_wp_dist = 1  # Distance between waypoints considered (meters)
-		self.max_route_deviation = 100  # Maximum allowed deviation to next waypoint (meters)
+		self.max_route_deviation = 6  # Maximum allowed deviation to next waypoint (meters)
 		self.target_wp_ahead = 5  # Distance to the next navigation waypoint along route
 		self.track_width = 1.4  # Lane width in meters
 		self.max_steering_angle = 70.0  # Max steering angle for the vehicle (degrees)
@@ -27,27 +27,27 @@ class Hyperparameters:
 		# World / simulation fixes
 		self.load_new_world = False
 		self.autopilotActions = False  # Use autopilot instead of actor
-		self.fixed_delta_seconds = 1.0 / 20
+		self.fixed_delta_seconds = 0.1
 		self.weather_change = int(2.5e4)
 		self.useAutopilot = False  # Enable autopilot during exploration phase
-		self.fps = 20
+		self.fps = 24
 
 		# Scenario settings
-		self.pretrained_model_path = r"C:\Users\jdr5622\ECE 464H\HondaAI\run\pdmorl_Train_Session_2-16-2026_bestCombined"  # Path to pretrained model for fine-tuning. Empty string = train from scratch. Do NOT include .zip extension.
+		self.pretrained_model_path = r"C:\Users\bc35638\Documents\Alert_Test\HondaAI\run\pdmorl_Train_Session_2-16-2026_bestCombined.zip"  # Path to pretrained model for fine-tuning. Empty string = train from scratch. Do NOT include .zip extension.
 
 		self.scenario = False # Can be: "intersection", "traffic_low", "traffic_high", "tunnel", "roundabout", "highway", "crossing", etc.
-		self.scenario_traffic = True  # Enable spawning traffic in scenarios
-		self.evaluate_scenarios = False  # Evaluate agent on predefined scenarios
+		self.scenario_traffic = False  # Enable spawning traffic in scenarios
+		self.evaluate_scenarios = True  # Evaluate agent on predefined scenarios
 		self.training_scenarios = ["traffic_low"]  # List of scenario names to train on (e.g. ["intersection", "highway", "highway_50mph"]). Empty = random town training.
 
 		# Reward parameters
-		self.target_speed_perc = 0.95
+		self.target_speed_perc = 0.8
 
 		# Training parameters
 		self.verbose = 0
 		self.tm_port = 8000  # Traffic manager port; can be overwritten
 		self.client_port = 2000  # CARLA client port; can be overwritten
-		self.evaluate = False  # Train or evaluate the agent
+		self.evaluate = True  # Train or evaluate the agent
 		self.showPolicy = True  # Evaluate policy performance with multiple weight samples
 		self.SPECATE = True  # Spectator follows the car; set False if rendering off-screen
 		self.next_map = 'Town04'  # Initial map

@@ -7,17 +7,17 @@
     "--client_port=2000",
     "--tm_port=8000"
   ],
-  "program":  "C:\\Users\\jdr5622\\ECE 464H\\HondaAI\\sb3\\td3_main.py",
+  "program":  "C:\\Users\\bc35638\\ECE 464H\\HondaAI\\sb3\\td3_main.py",
   "codePath":  "sb3\\td3_main.py",
   "git":  {
     "remote":  "https://github.com/julianrod04/HondaAI.git",
     "commit":  "4aceffc20f9f38f960ced2435b00c05863bb57df"
   },
   "email":  "juliandrodriguez04@gmail.com",
-  "root":  "C:\\Users\\jdr5622\\ECE 464H\\HondaAI",
+  "root":  "C:\\Users\\bc35638\\ECE 464H\\HondaAI",
   "host":  "ECEN-A76568",
-  "username":  "jdr5622",
-  "executable":  "C:\\Users\\jdr5622\\ECE 464H\\HondaAI\\venv\\Scripts\\python.exe",
+  "username":  "bc35638",
+  "executable":  "C:\\Users\\bc35638\\ECE 464H\\HondaAI\\venv\\Scripts\\python.exe",
   "codePathLocal":  "sb3\\td3_main.py",
   "cpu_count":  20,
   "cpu_count_logical":  20,

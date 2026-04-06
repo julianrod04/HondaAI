@@ -99,6 +99,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import random
 import sys
 import time
 from collections import deque
@@ -928,13 +929,24 @@ def run_av_episode(
     if mini_scenario is not None:
         _obstacle_actors = _spawn_scenario_obstacles(_av_world, env.vehicle, mini_scenario, spawn_index=8)
 
+    _av_driving_score = 0.0
+    _speed_print_time = time.time()
     try:
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, _, done, _, info = env.step(action)
-            sim_t += _DT
+            sim_t += config.fixed_delta_seconds
+
+            _now = time.time()
+            if _now - _speed_print_time >= 1.0:
+                _speed_print_time = _now
+                _vel = env.vehicle.get_velocity()
+                _speed_kmh = ((_vel.x**2 + _vel.y**2 + _vel.z**2) ** 0.5) * 3.6
+                _limit_kmh = env.vehicle.get_speed_limit()
+                print(f"AV Speed: {_speed_kmh:.1f} km/h  (limit: {_limit_kmh:.0f} km/h)")
 
             if done:
+                _av_driving_score = float(info.get('adjusted_driving_core', 0.0))
                 wp_now = steps[-1].wp_index if steps else 0
                 print(f"\n[av_run] *** EPISODE TERMINATED ***")
                 print(f"  sim_time          : {sim_t:.1f}s")
@@ -979,7 +991,7 @@ def run_av_episode(
 
     prog = steps[-1].progress() * 100 if steps else 0.0
     print(f"\n[av_run] DONE → {len(steps)} steps, route completion {prog:.1f}%")
-    return traj, steps
+    return traj, steps, _av_driving_score
 
 
 # ── PHASE 2: HUMAN RUN WITH ALERTS ────────────────────────────────────────────
@@ -1195,7 +1207,9 @@ class AlertPipeline:
         max_iterations:       int  = 20,
         host:                 str  = "localhost",
         port:                 int  = 2000,
-        save_dir:             str  = "./pipeline_runs",
+        save_dir:             str   = "./pipeline_runs",
+        participant_number:   int   = 0,
+        session_duration:     float = 25 * 60,
     ) -> None:
         self.model_path           = model_path
         self.scenario             = scenario
@@ -1205,10 +1219,20 @@ class AlertPipeline:
         self.port                 = port
         self.save_dir             = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.participant_number   = participant_number
+        self.session_duration     = session_duration
 
         self.alert_model    = MoEAlertModel(state_dim=DEFAULT_STATE_DIM)
         self.style_profile: Optional[np.ndarray] = None
         self._loss_history: deque = deque(maxlen=_CONV_WINDOW)
+
+        # Per-participant CSV log
+        self._participant_csv = self.save_dir / f"participant_{participant_number}_log.csv"
+        with open(self._participant_csv, "w", newline="") as _f:
+            csv.writer(_f).writerow(
+                ["participant_number", "scenario", "iteration", "driving_score", "episode_loss"]
+            )
+
         print(f"[pipeline] Ready. Saving to: {self.save_dir.resolve()}")
 
     # ── Persistence ──────────────────────────────────────────────────────
@@ -1261,14 +1285,22 @@ class AlertPipeline:
             _disconnect(world)
         print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
 
-        # Scenario loop — for each mini scenario: AV run → human run → train
-        for scenario_idx, mini in enumerate(MINI_SCENARIOS):
+        # Scenario loop — randomly pick scenarios until 25-minute session ends
+        session_end = time.time() + self.session_duration
+        scenario_idx = 0
+        while time.time() < session_end:
+            elapsed_min = (time.time() - (session_end - self.session_duration)) / 60
+            remaining_min = (session_end - time.time()) / 60
+            mini = random.choice(MINI_SCENARIOS)
+            scenario_map = _SCENARIO_MAPS.get(mini.base_scenario, "Town01")
+
             print(f"\n{'#'*60}")
-            print(f"# SCENARIO {scenario_idx+1} / {len(MINI_SCENARIOS)}  —  {mini.name.upper()}")
+            print(f"# ITERATION {scenario_idx+1}  —  {mini.name.upper()}")
+            print(f"# Elapsed: {elapsed_min:.1f} min  |  Remaining: {remaining_min:.1f} min")
             print(f"{'#'*60}")
 
             # Phase 1 — AV headless run with obstacles
-            traj, av_steps = run_av_episode(
+            traj, av_steps, av_driving_score = run_av_episode(
                 self.model_path, self.style_profile,
                 mini.base_scenario, self.port,
                 mini_scenario=mini,
@@ -1277,7 +1309,7 @@ class AlertPipeline:
             # Phase 2 — human run with obstacles and alerts
             print(f"\n[pipeline] Re-enabling UE4 rendering for human run …")
             client, world = _connect(self.host, self.port, render=True)
-            world = _load_map(client, world, target_map)
+            world = _load_map(client, world, scenario_map)
             try:
                 step_log = run_human_episode(
                     client, world, traj, av_steps,
@@ -1293,17 +1325,18 @@ class AlertPipeline:
             self._loss_history.append(loss)
             self._save_csv(step_log, scenario_idx)
             self._save(scenario_idx)
+            with open(self._participant_csv, "a", newline="") as _f:
+                csv.writer(_f).writerow([
+                    self.participant_number, mini.name, scenario_idx,
+                    av_driving_score, loss,
+                ])
 
-            print(f"\n[pipeline] Scenario '{mini.name}' done.  Loss={loss:.4f}  "
-                  f"History={[f'{v:.4f}' for v in self._loss_history]}")
+            print(f"\n[pipeline] Iteration {scenario_idx+1} ('{mini.name}') done.  "
+                  f"Loss={loss:.4f}  History={[f'{v:.4f}' for v in self._loss_history]}")
 
-            if self._converged():
-                rng = max(self._loss_history) - min(self._loss_history)
-                print(f"\n[pipeline] CONVERGED (loss range={rng:.4f} < {_CONV_THRESHOLD})"
-                      f" after scenario {scenario_idx+1}.")
-                break
+            scenario_idx += 1
 
-        print("\n[pipeline] All scenarios complete.")
+        print(f"\n[pipeline] 25-minute session complete after {scenario_idx} iteration(s).")
 
 
 # ── SMOKE TEST (--test flag, no CARLA required) ───────────────────────────────
@@ -1388,6 +1421,10 @@ def main() -> None:
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=2000)
     p.add_argument("--save-dir", default="./pipeline_runs")
+    p.add_argument("--participant-number", type=int, default=0,
+                   help="Participant ID — used to name the per-participant CSV log")
+    p.add_argument("--session-duration", type=float, default=25.0,
+                   help="Total session duration in minutes (default: 25)")
     p.add_argument("--test", action="store_true",
                    help="Run smoke tests (no CARLA or model needed) then exit")
     args = p.parse_args()
@@ -1406,6 +1443,8 @@ def main() -> None:
         host=args.host,
         port=args.port,
         save_dir=args.save_dir,
+        participant_number=args.participant_number,
+        session_duration=args.session_duration * 60,
     ).run()
 
 
