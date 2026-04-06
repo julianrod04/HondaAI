@@ -226,6 +226,63 @@ _SCENARIO_MAPS: Dict[str, str] = {
 }
 
 
+# ── MINI SCENARIO DEFINITIONS ─────────────────────────────────────────────────
+
+@dataclass
+class MiniScenario:
+    """A short obstacle scenario layered on top of an existing CarlaEnv scenario.
+
+    Obstacles are placed relative to the hero vehicle's spawn transform using
+    forward/right offsets, so they always land on the same road segment.
+
+    Attributes:
+        name          : human-readable label shown in pipeline output
+        base_scenario : CarlaEnv scenario name used for the AV route
+        route_length  : max_waypoints cap — keeps the run to 1-3 blocks
+        obstacles     : list of (forward_m, right_m, blueprint_id) tuples
+                        forward_m  — metres ahead along the hero spawn heading
+                        right_m    — metres right of that heading (negative = left)
+                        blueprint_id — CARLA vehicle blueprint string
+    """
+    name:          str
+    base_scenario: str
+    route_length:  int
+    obstacles:     List[Tuple[float, float, str]]
+
+
+# Three short scenarios designed to be easy for the AV to navigate.
+# Obstacles are parked cars placed 2.5 m to the side of the lane centre so
+# the AV can pass without collision while the human driver must steer around
+# them.  Adjust forward_m / right_m if the obstacles land in the wrong spot.
+MINI_SCENARIOS: List[MiniScenario] = [
+    MiniScenario(
+        name          = "parked_right",
+        base_scenario = "intersection",
+        route_length  = 80,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.tesla.model3"),   # parked car on right side of lane
+        ],
+    ),
+    MiniScenario(
+        name          = "parked_left",
+        base_scenario = "intersection",
+        route_length  = 80,
+        obstacles     = [
+            (20.0, -1.5, "vehicle.tesla.model3"),   # parked car on left side of lane
+        ],
+    ),
+    MiniScenario(
+        name          = "double_park",
+        base_scenario = "intersection",
+        route_length  = 100,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.tesla.model3"),   # right side 20 m ahead
+            (45.0, -1.5, "vehicle.audi.a2"),         # left side  45 m ahead
+        ],
+    ),
+]
+
+
 # ── DATA CLASSES ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -296,7 +353,7 @@ class ControlReader:
             self._wheel.init()
             print(f"[input] Steering wheel detected: {self._wheel.get_name()}")
             print("[input]   Axis 0 = steering | Axis 1 = brake | Axis 3 = throttle")
-            ffb_init()
+            # ffb_init() disabled — SDK init overrides G HUB spring settings even when FFB calls fail
         else:
             print("[input] No wheel detected — keyboard fallback (W/A/S/D).")
 
@@ -413,6 +470,61 @@ def _spawn_hero(world: object, spawn_index: int = 8) -> object:
             print(f"[spawn] Hero spawned at spawn point {idx}.")
             return v
     raise RuntimeError("Could not spawn hero at any spawn point — all occupied.")
+
+
+def _spawn_scenario_obstacles(
+    world: object,
+    hero:  object,
+    scenario: MiniScenario,
+    spawn_index: int = 8,
+) -> List[object]:
+    """Spawn static obstacle vehicles relative to spawn point 8.
+
+    Uses the map spawn point directly (not the hero's current transform) so
+    the obstacle position is identical whether called from the AV phase or the
+    human phase, and is not affected by any physics drift of the hero vehicle.
+    The hero is only used to get the correct ground-level z.
+    Returns the list of spawned actors so the caller can destroy them later.
+    """
+    pts   = world.get_map().get_spawn_points()  # type: ignore[union-attr]
+    tf    = pts[spawn_index % len(pts)]          # fixed reference — never drifts
+    yaw_r = math.radians(tf.rotation.yaw)
+    # Unit vectors in CARLA's XY plane (Z-up, yaw measured from +X axis)
+    fwd_x, fwd_y =  math.cos(yaw_r),  math.sin(yaw_r)
+    rgt_x, rgt_y =  math.sin(yaw_r), -math.cos(yaw_r)   # 90° clockwise = right
+
+    bp_lib  = world.get_blueprint_library()  # type: ignore[union-attr]
+    spawned: List[object] = []
+
+    for fwd_m, right_m, bp_id in scenario.obstacles:
+        try:
+            bp = bp_lib.find(bp_id)
+        except Exception:
+            print(f"[obstacles] Blueprint '{bp_id}' not found — skipping.")
+            continue
+
+        # Use the hero's *actual* location z (post-physics settle) rather than the
+        # raw spawn-transform z (which is ~0.0 in Town01 and causes try_spawn_actor
+        # to reject the position as underground).  hero.get_location().z is the
+        # settled vehicle-centre height and is the correct value for any vehicle
+        # on the same flat road.
+        loc = carla.Location(
+            x = tf.location.x + fwd_m * fwd_x + right_m * rgt_x,
+            y = tf.location.y + fwd_m * fwd_y + right_m * rgt_y,
+            z = hero.get_location().z - 0.25,  # type: ignore[union-attr]
+        )
+        obs_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw))
+        actor  = world.try_spawn_actor(bp, obs_tf)  # type: ignore[union-attr]
+        if actor is not None:
+            actor.set_simulate_physics(False)   # freeze immediately — no drift or fall
+            spawned.append(actor)
+            print(f"[obstacles] Spawned '{bp_id}'  fwd={fwd_m}m  right={right_m}m  z={loc.z:.2f}  id={actor.id}")
+        else:
+            print(f"[obstacles] Could not spawn '{bp_id}' at fwd={fwd_m}m right={right_m}m — position occupied.")
+
+    if spawned:
+        world.tick()  # register all actors before the game loop starts  # type: ignore[union-attr]
+    return spawned
 
 
 # ── DEBUG ALERT DRAWING (CARLA UE4 WINDOW) ───────────────────────────────────
@@ -644,6 +756,17 @@ def run_calibration(
     print("Watch the CARLA UE4 window. Drive freely to calibrate your style.")
     print(f"{'='*60}")
 
+    # Clear any NPC vehicles/walkers so calibration is an empty road.
+    _cal_clear = [
+        a for a in world.get_actors()
+        if a.type_id.startswith("vehicle.") or a.type_id.startswith("walker.")
+    ]
+    for _a in _cal_clear:
+        _a.destroy()
+    if _cal_clear:
+        world.tick()
+    print(f"[calibration] Cleared {len(_cal_clear)} NPC actor(s) from map.")
+
     hero      = _spawn_hero(world)
     regressor = HumanStyleRegressor()
     regressor.attach_collision_sensor(world, hero)
@@ -710,6 +833,7 @@ def run_av_episode(
     style_profile: np.ndarray,
     scenario:      str,
     port:          int = 2000,
+    mini_scenario: Optional[MiniScenario] = None,
 ) -> Tuple[AVTrajectory, List[AVStepData]]:
     """Headless AV episode. CarlaEnv manages its own CARLA connection.
     UE4 rendering is disabled during this phase for speed.
@@ -769,6 +893,17 @@ def run_av_episode(
     tick   = 0
 
     obs, _ = env.reset()
+    # Truncate route AFTER reset — CarlaEnv.reset() always overwrites max_waypoints
+    # from its internal scenario table, so the only reliable way to shorten the
+    # route is to slice it here after the fact.
+    if mini_scenario is not None:
+        env.route = env.route[:mini_scenario.route_length]
+        # waypoint_logic uses config.max_waypoints for the done check and index
+        # bounds (including a target_wp_ahead lookahead), so it must match the
+        # truncated route length minus the lookahead to stay in bounds.
+        env.config.max_waypoints = len(env.route) - env.config.target_wp_ahead
+        print(f"[av_run] Route truncated to {len(env.route)} waypoints "
+              f"(max_waypoints set to {env.config.max_waypoints}) for scenario '{mini_scenario.name}'.")
     total  = max(len(env.route), 1)
     print(f"[av_run] Environment reset. Route: {total} waypoints.")
 
@@ -787,6 +922,11 @@ def run_av_episode(
         for _a in _to_destroy:
             _a.destroy()
         _av_world.tick()
+
+    # Spawn scenario obstacles after world cleanup so they are not swept away.
+    _obstacle_actors: List[object] = []
+    if mini_scenario is not None:
+        _obstacle_actors = _spawn_scenario_obstacles(_av_world, env.vehicle, mini_scenario, spawn_index=8)
 
     try:
         while not done:
@@ -825,10 +965,15 @@ def run_av_episode(
                 total_waypoints=total,
             ))
             tick += 1
-            if tick % (FPS * 10) == 0:
+            if tick % FPS == 0:
                 print(f"  [av_run] t={sim_t:.1f}s  wp={steps[-1].wp_index}/{total}"
                       f"  speed={steps[-1].speed:.1f}m/s")
     finally:
+        for _obs in _obstacle_actors:
+            try:
+                _obs.destroy()
+            except Exception:
+                pass
         env.close()
         print("[av_run] CarlaEnv closed.")
 
@@ -840,14 +985,15 @@ def run_av_episode(
 # ── PHASE 2: HUMAN RUN WITH ALERTS ────────────────────────────────────────────
 
 def run_human_episode(
-    client:       object,
-    world:        object,
-    traj:         AVTrajectory,
-    av_steps:     List[AVStepData],
-    av_style:     np.ndarray,
-    alert_model:  MoEAlertModel,
-    max_duration: float = 300.0,
-    force_arrow:  bool  = False,
+    client:        object,
+    world:         object,
+    traj:          AVTrajectory,
+    av_steps:      List[AVStepData],
+    av_style:      np.ndarray,
+    alert_model:   MoEAlertModel,
+    max_duration:  float = 300.0,
+    force_arrow:   bool  = False,
+    mini_scenario: Optional[MiniScenario] = None,
 ) -> List[HumanStepData]:
     """Human drives with alert overlays drawn into the UE4 window.
 
@@ -874,7 +1020,13 @@ def run_human_episode(
     hero      = _spawn_hero(world)
     regressor = HumanStyleRegressor()
     regressor.attach_collision_sensor(world, hero)
+    world.tick()  # settle hero physics so get_location().z is accurate for obstacle z
     print("[human_run] Hero spawned and collision sensor attached.")
+
+    _obstacle_actors: List[object] = []
+    if mini_scenario is not None:
+        _obstacle_actors = _spawn_scenario_obstacles(world, hero, mini_scenario, spawn_index=8)
+        print(f"[human_run] Scenario '{mini_scenario.name}' — {len(_obstacle_actors)} obstacle(s) spawned.")
 
     # ── Sample alert ONCE ─────────────────────────────────────────────────
     # Use the calibrated style profile as the initial state.  Since style is
@@ -915,8 +1067,8 @@ def run_human_episode(
 
     try:
         while True:
-            if sim_t >= max(max_duration, av_end_t):
-                print(f"[human_run] Episode duration reached ({sim_t:.1f}s).")
+            if sim_t >= av_end_t:
+                print(f"[human_run] AV reached last waypoint — ending human run ({sim_t:.1f}s).")
                 break
             if ctrl_reader.quit_request:
                 print("[human_run] User ended episode early (Q pressed).")
@@ -982,6 +1134,11 @@ def run_human_episode(
             ))
 
     finally:
+        for _obs in _obstacle_actors:
+            try:
+                _obs.destroy()
+            except Exception:
+                pass
         ctrl_reader.close()
         regressor.destroy_collision_sensor()
         hero.destroy()
@@ -1091,9 +1248,9 @@ class AlertPipeline:
     # ── Run ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        target_map = _SCENARIO_MAPS.get(self.scenario, "Town01")
+        target_map = _SCENARIO_MAPS.get(MINI_SCENARIOS[0].base_scenario, "Town01")
 
-        # Phase 0 — calibration (always run, never skipped)
+        # Phase 0 — calibration (once, before any scenario)
         print(f"\n[pipeline] Starting calibration (map={target_map}) …")
         client, world = _connect(self.host, self.port, render=True)
         world = _load_map(client, world, target_map)
@@ -1104,21 +1261,20 @@ class AlertPipeline:
             _disconnect(world)
         print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
 
-        # Phase 1 — AV run once before the loop.  The same trajectory is reused
-        # for every iteration so each human run is compared against an identical
-        # reference, and the expensive AV episode is not repeated needlessly.
-        traj, av_steps = run_av_episode(
-            self.model_path, self.style_profile,
-            self.scenario, self.port,
-        )
-
-        # Iteration loop
-        for it in range(self.max_iterations):
+        # Scenario loop — for each mini scenario: AV run → human run → train
+        for scenario_idx, mini in enumerate(MINI_SCENARIOS):
             print(f"\n{'#'*60}")
-            print(f"# ITERATION {it+1} / {self.max_iterations}")
+            print(f"# SCENARIO {scenario_idx+1} / {len(MINI_SCENARIOS)}  —  {mini.name.upper()}")
             print(f"{'#'*60}")
 
-            # Phase 2 — human run (direct connection, rendering ON)
+            # Phase 1 — AV headless run with obstacles
+            traj, av_steps = run_av_episode(
+                self.model_path, self.style_profile,
+                mini.base_scenario, self.port,
+                mini_scenario=mini,
+            )
+
+            # Phase 2 — human run with obstacles and alerts
             print(f"\n[pipeline] Re-enabling UE4 rendering for human run …")
             client, world = _connect(self.host, self.port, render=True)
             world = _load_map(client, world, target_map)
@@ -1126,7 +1282,8 @@ class AlertPipeline:
                 step_log = run_human_episode(
                     client, world, traj, av_steps,
                     self.style_profile, self.alert_model,
-                    force_arrow=(it == 0),
+                    force_arrow=(scenario_idx == 0),
+                    mini_scenario=mini,
                 )
             finally:
                 _disconnect(world)
@@ -1134,19 +1291,19 @@ class AlertPipeline:
             # Phase 3 — train
             loss = flush_training(self.alert_model, step_log)
             self._loss_history.append(loss)
-            self._save_csv(step_log, it)
-            self._save(it)
+            self._save_csv(step_log, scenario_idx)
+            self._save(scenario_idx)
 
-            print(f"\n[pipeline] Iteration {it+1} done.  Loss={loss:.4f}  "
+            print(f"\n[pipeline] Scenario '{mini.name}' done.  Loss={loss:.4f}  "
                   f"History={[f'{v:.4f}' for v in self._loss_history]}")
 
             if self._converged():
                 rng = max(self._loss_history) - min(self._loss_history)
                 print(f"\n[pipeline] CONVERGED (loss range={rng:.4f} < {_CONV_THRESHOLD})"
-                      f" after {it+1} iterations.")
+                      f" after scenario {scenario_idx+1}.")
                 break
 
-        print("\n[pipeline] All iterations complete.")
+        print("\n[pipeline] All scenarios complete.")
 
 
 # ── SMOKE TEST (--test flag, no CARLA required) ───────────────────────────────

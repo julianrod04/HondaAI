@@ -11,12 +11,24 @@ FFB_STRENGTH = 2    # very light — well below G920 default (~80-100)
 
 # Common install paths for the Logitech Steering Wheel SDK DLL.
 _LOGI_DLL_PATHS = [
+    r"C:\Program Files\Logi\wheel_sdk\9_1_0\logi_steering_wheel_x64.dll",
     r"C:\Program Files\Logitech\Gaming Software\SDKs\Steering Wheel\x64\LogitechSteeringWheelEnginesWrapper.dll",
     r"C:\Program Files (x86)\Logitech\Gaming Software\SDKs\Steering Wheel\x64\LogitechSteeringWheelEnginesWrapper.dll",
     r"C:\Program Files\LGHUB\sdk\Steering Wheel\x64\LogitechSteeringWheelEnginesWrapper.dll",
 ]
 
 _logi_sdk = None
+
+def normalize_steering(val):
+    # Wheel axis already -1 to 1 (usually)
+    return float(val)
+
+def normalize_throttle(val):
+    # Pedals usually [1 -> -1], invert + scale
+    return float((1 - val) / 2)
+
+def normalize_brake(val):
+    return float((1 - val) / 2)
 
 def _load_logi_sdk():
     for path in _LOGI_DLL_PATHS:
@@ -38,9 +50,10 @@ def ffb_init():
         return
     try:
         _logi_sdk.LogiSteeringInitialize(False)
+        _logi_sdk.LogiUpdate()  # required before any effects will apply
         # Spring effect: gives the centering / road-feel resistance.
         # saturation=FFB_STRENGTH caps the max force; coefficient controls rate.
-        _logi_sdk.LogiPlaySpringForce(
+        ret = _logi_sdk.LogiPlaySpringForce(
             0,              # device index
             0,              # offset (centre at 0)
             FFB_STRENGTH,   # saturation  (0-100)
@@ -48,7 +61,10 @@ def ffb_init():
         )
         # Damper: smooths oscillations; keep proportional to spring.
         _logi_sdk.LogiPlayDamperForce(0, FFB_STRENGTH // 2)
-        print(f"[ffb] Force feedback initialised at strength {FFB_STRENGTH}%.")
+        if ret:
+            print(f"[ffb] Force feedback initialised at strength {FFB_STRENGTH}%.")
+        else:
+            print("[ffb] SDK loaded but spring force failed — is G HUB running and wheel connected?")
     except Exception as exc:
         print(f"[ffb] SDK call failed: {exc}")
 
@@ -65,6 +81,55 @@ def ffb_shutdown():
 
 
 def get_wheel_control(
+    wheel,
+    control,
+    reverse_mode: bool,
+    debug: bool = False,
+) -> carla.VehicleControl:
+    """
+    Logitech G920 wheel + pedals input handler.
+
+    Axis mapping (G920):
+      - Axis 0: steering      (-1 left, +1 right, ~0 centered)
+      - Axis 1: brake         (-1 at rest -> +1 fully pressed)
+      - Axis 2: clutch        (ignored)
+      - Axis 3: accelerator   (-1 at rest -> +1 fully pressed)
+
+    If your gas/brake are on different axes, just change the axis indices.
+    """
+    # Reset
+    control.throttle = 0.0
+    control.steer = 0.0
+    control.brake = 0.0
+
+    # Reverse gear flag (you toggle reverse_mode elsewhere)
+    control.reverse = reverse_mode
+
+    # ---- Steering (Axis 0) ----
+    steer_axis = wheel.get_axis(0)
+    control.steer = normalize_steering(steer_axis)
+
+    # ---- Accelerator (Axis 3) ----
+    # Use raw axis value as throttle (confirmed to give correct max speed at full press).
+    # Floor at IDLE_THROTTLE so the car creeps forward at rest, like a real car.
+    IDLE_THROTTLE = 0.20
+    accel_axis = wheel.get_axis(1)
+    accel_axis = max (IDLE_THROTTLE, normalize_throttle(accel_axis))
+    control.throttle = accel_axis
+
+    # ---- Brake (Axis 1) ----
+    brake_axis = wheel.get_axis(3)  # -1 rest, +1 pressed
+    # print('brake_axis', brake_axis)
+    raw_brake = normalize_brake(brake_axis)
+    control.brake = raw_brake if raw_brake > 0.01 else 0.0
+
+    # ---- Hand brake (pick any button you like, example: button 5) ----
+    handbrake_button = wheel.get_button(5)
+    control.hand_brake = bool(handbrake_button)
+
+    return control
+
+def old_get_wheel_control(
     wheel,
     control,
     reverse_mode: bool,

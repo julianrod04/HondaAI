@@ -15,6 +15,16 @@ from alerts import AlertType, Dashboard, DrivingMonitor, AlertDisplayConfig
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 
+def normalize_steering(val):
+    # Wheel axis already -1 to 1 (usually)
+    return float(val)
+
+def normalize_throttle(val):
+    # Pedals usually [1 -> -1], invert + scale
+    return float((1 - val) / 2)
+
+def normalize_brake(val):
+    return float((1 - val) / 2)
 
 def main():
     # Configure SDL2 environment variables for better XInput/Xbox controller support
@@ -236,7 +246,37 @@ def main():
                         print("Reverse mode:", reverse_mode)
 
             if wheel is not None:
-                control = get_wheel_control(wheel, control, reverse_mode)
+                # control = get_wheel_control(wheel, control, reverse_mode)
+                pygame.event.pump()
+
+                # AXIS MAPPING (may vary per system)
+                steering_axis = wheel.get_axis(0)
+                throttle_axis = wheel.get_axis(1)
+                brake_axis    = wheel.get_axis(3)
+
+                control.steer    = normalize_steering(steering_axis)
+                control.throttle = normalize_throttle(throttle_axis)
+                # Both pedals rest at raw 1.0 -> normalized 0.0, but apply a
+                # small deadzone so a resting brake axis never locks the car
+                raw_brake = normalize_brake(brake_axis)
+                print("normalized")
+                control.brake = raw_brake if raw_brake > 0.01 else 0.0
+
+                # Reverse gear toggled by right paddle shifter (button 4)
+                # Handled in the event loop below via JOYBUTTONDOWN
+                control.reverse = reverse_mode
+
+                # Print any buttons currently pressed (helps identify paddle index)
+                pressed_buttons = [i for i in range(wheel.get_numbuttons()) if wheel.get_button(i)]
+                if pressed_buttons:
+                    print(f"BUTTONS PRESSED: {pressed_buttons}")
+
+                # Raw values help confirm correct axis indices for your wheel
+                print(
+                    f"RAW  steer={steering_axis:.2f}  throttle={throttle_axis:.2f}  brake={brake_axis:.2f} | "
+                    f"NORM steer={control.steer:.2f}  throttle={control.throttle:.2f}  brake={control.brake:.2f}"
+                )
+
             else:
                 keys = pygame.key.get_pressed()
                 control = get_keyboard_control(keys, control, reverse_mode)

@@ -167,7 +167,7 @@ if __name__ == "__main__":
 
 	if evaluate_model:
 		# Path to the pretrained model for evaluation
-		model_path = "../run/pdmorl_Train_Session_2-16-2026_bestCombined.zip"
+		model_path = "../run/pdmorl_Train_Session_2-16-2026_bestCombined"
 
 		# Small delays to ensure environment and resources are ready
 		time.sleep(5)
@@ -380,6 +380,7 @@ if __name__ == "__main__":
 					steps = 0
 					obs = env.reset()
 					total_reward = 0
+					_speed_print_time = time.time()
 
 					while not done:
 						steps += 1
@@ -389,6 +390,14 @@ if __name__ == "__main__":
 						# Predict deterministic action using the trained model
 						action, _states = model.predict(obs, deterministic=True)
 						obs, rewards, done, info = env.step(action)
+
+						# Print vehicle speed every second using CARLA API
+						_now = time.time()
+						if _now - _speed_print_time >= 1.0:
+							_speed_print_time = _now
+							_vel = env.envs[0].vehicle.get_velocity()
+							_speed = (_vel.x**2 + _vel.y**2 + _vel.z**2) ** 0.5
+							print(f"AV Speed: {_speed:.2f} m/s")
 
 						# Unpack info and rewards for easier access
 						info = info[0]
