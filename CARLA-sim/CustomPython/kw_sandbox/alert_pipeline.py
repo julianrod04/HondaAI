@@ -102,7 +102,7 @@ import math
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -232,33 +232,65 @@ _SCENARIO_MAPS: Dict[str, str] = {
 class MiniScenario:
     """A short obstacle scenario layered on top of an existing CarlaEnv scenario.
 
-    Obstacles are placed relative to the hero vehicle's spawn transform using
-    forward/right offsets, so they always land on the same road segment.
+    Obstacles are placed relative to a fixed map spawn point (spawn_index) using
+    forward/right offsets, so they always land on the same road segment regardless
+    of physics drift.
 
     Attributes:
         name          : human-readable label shown in pipeline output
         base_scenario : CarlaEnv scenario name used for the AV route
         route_length  : max_waypoints cap — keeps the run to 1-3 blocks
-        obstacles     : list of (forward_m, right_m, blueprint_id) tuples
-                        forward_m  — metres ahead along the hero spawn heading
-                        right_m    — metres right of that heading (negative = left)
+        spawn_index   : index into world.get_map().get_spawn_points() used as the
+                        reference origin for obstacle placement AND the human hero
+                        start position.  Must be on (or very near) the AV's route
+                        so both drivers encounter the obstacles.
+        obstacles     : list of (forward_m, right_m, blueprint_id) tuples for
+                        STATIC parked vehicles (physics disabled, never move).
+                        forward_m    — metres ahead along the spawn-point heading
+                        right_m      — metres right of that heading (negative = left)
                         blueprint_id — CARLA vehicle blueprint string
+        npc_autopilot : list of (forward_m, right_m, blueprint_id) tuples for
+                        slow-moving NPC vehicles spawned with autopilot enabled.
+                        Place them 40–80 m ahead so the AV/human must overtake or
+                        follow.  Keep this list short (0–2 vehicles) so the AV can
+                        handle them without collision.
+        npc_crash     : list of (forward_m, right_m, blueprint_id, steer) tuples
+                        for vehicles that immediately veer off-road and crash.
+                        forward_m — spawn distance ahead (20–40 m recommended)
+                        right_m   — lateral offset at spawn (0.0 = lane centre)
+                        steer     — steering applied instantly: +1.0 = hard right
+                                    (off right kerb), -1.0 = hard left (hits barrier
+                                    or opposing-lane wall).  Use 0.7–1.0 magnitude.
+                        Physics is enabled; a throttle=0.7 control is applied once
+                        and persists, so the vehicle drives itself off the road and
+                        creates a wreck the driver must navigate around.
     """
     name:          str
     base_scenario: str
     route_length:  int
-    obstacles:     List[Tuple[float, float, str]]
+    spawn_index:   int                                    = 8
+    obstacles:     List[Tuple[float, float, str]]         = field(default_factory=list)
+    npc_autopilot: List[Tuple[float, float, str]]         = field(default_factory=list)
+    npc_crash:     List[Tuple[float, float, str, float]]  = field(default_factory=list)
 
 
-# Three short scenarios designed to be easy for the AV to navigate.
-# Obstacles are parked cars placed 2.5 m to the side of the lane centre so
+# ── Original 3 scenarios (Town01, spawn 8) ────────────────────────────────────
+# Obstacles are parked cars placed ~1.5 m to the side of the lane centre so
 # the AV can pass without collision while the human driver must steer around
 # them.  Adjust forward_m / right_m if the obstacles land in the wrong spot.
+#
+# ── 10 additional scenarios (Town01–Town04, various spawn points) ─────────────
+# Spawn indices are chosen to land the hero on a straight, unobstructed road
+# segment that also sits on the AV's CarlaEnv route for the matching
+# base_scenario.  If an index is blocked at runtime _spawn_hero() falls back
+# to the nearest free point automatically.
 MINI_SCENARIOS: List[MiniScenario] = [
+    # ── original ──────────────────────────────────────────────────────────────
     MiniScenario(
         name          = "parked_right",
         base_scenario = "intersection",
         route_length  = 80,
+        spawn_index   = 8,
         obstacles     = [
             (20.0,  1.5, "vehicle.tesla.model3"),   # parked car on right side of lane
         ],
@@ -267,6 +299,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
         name          = "parked_left",
         base_scenario = "intersection",
         route_length  = 80,
+        spawn_index   = 8,
         obstacles     = [
             (20.0, -1.5, "vehicle.tesla.model3"),   # parked car on left side of lane
         ],
@@ -275,9 +308,475 @@ MINI_SCENARIOS: List[MiniScenario] = [
         name          = "double_park",
         base_scenario = "intersection",
         route_length  = 100,
+        spawn_index   = 8,
         obstacles     = [
             (20.0,  1.5, "vehicle.tesla.model3"),   # right side 20 m ahead
             (45.0, -1.5, "vehicle.audi.a2"),         # left side  45 m ahead
+        ],
+    ),
+
+    # ── new: Town01 variants (CarlaEnv spawnpoint=8 for "intersection") ──────────
+    MiniScenario(
+        name          = "town01_far_parked",
+        base_scenario = "intersection",
+        route_length  = 100,
+        spawn_index   = 8,           # matches CarlaEnv spawnpoint for "intersection"
+        obstacles     = [
+            (35.0,  1.5, "vehicle.nissan.micra"),    # single parked car further ahead
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_chicane",
+        base_scenario = "intersection",
+        route_length  = 120,
+        spawn_index   = 8,
+        obstacles     = [
+            (18.0,  1.5, "vehicle.audi.a2"),          # right  18 m
+            (36.0, -1.5, "vehicle.mini.cooperst"),    # left   36 m
+            (54.0,  1.5, "vehicle.citroen.c3"),       # right  54 m
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_tight_gap",
+        base_scenario = "intersection",
+        route_length  = 90,
+        spawn_index   = 8,
+        obstacles     = [
+            (25.0,  1.2, "vehicle.tesla.model3"),     # right — gap is narrower
+            (25.0, -1.2, "vehicle.volkswagen.t2"),    # left  — both at same distance
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_triple_stagger",
+        base_scenario = "intersection",
+        route_length  = 130,
+        spawn_index   = 8,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.nissan.micra"),
+            (40.0, -1.5, "vehicle.audi.a2"),
+            (60.0,  1.5, "vehicle.mini.cooperst"),
+        ],
+    ),
+
+    # ── new: Town02 variants (CarlaEnv spawnpoint=57 for "traffic_low/high") ────
+    MiniScenario(
+        name          = "town02_parked_right",
+        base_scenario = "traffic_low",
+        route_length  = 80,
+        spawn_index   = 57,          # matches CarlaEnv spawnpoint for "traffic_low"
+        obstacles     = [
+            (22.0,  1.5, "vehicle.citroen.c3"),       # single parked car, right
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_double_stagger",
+        base_scenario = "traffic_low",
+        route_length  = 100,
+        spawn_index   = 57,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.audi.a2"),
+            (42.0, -1.5, "vehicle.tesla.model3"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_slow_npc",
+        base_scenario = "traffic_high",
+        route_length  = 100,
+        spawn_index   = 57,          # matches CarlaEnv spawnpoint for "traffic_high"
+        obstacles     = [
+            (22.0,  1.5, "vehicle.nissan.micra"),     # parked car forces lane change
+        ],
+        npc_autopilot = [
+            (55.0,  0.0, "vehicle.mini.cooperst"),    # slow-moving vehicle ahead on autopilot
+        ],
+    ),
+
+    # ── new: Town03 variants ───────────────────────────────────────────────────
+    MiniScenario(
+        name          = "town03_narrow_pass",
+        base_scenario = "tunnel",
+        route_length  = 90,
+        spawn_index   = 78,          # matches CarlaEnv spawnpoint for "tunnel"
+        obstacles     = [
+            (25.0,  1.0, "vehicle.audi.a2"),          # slightly into lane — tight squeeze
+        ],
+    ),
+    MiniScenario(
+        name          = "town03_roundabout_approach",
+        base_scenario = "roundabout",
+        route_length  = 110,
+        spawn_index   = 0,           # matches CarlaEnv spawnpoint for "roundabout"
+        obstacles     = [
+            (20.0,  1.5, "vehicle.citroen.c3"),
+            (40.0, -1.5, "vehicle.volkswagen.t2"),
+        ],
+    ),
+
+    # ── new: Town04 variants ───────────────────────────────────────────────────
+    MiniScenario(
+        name          = "town04_highway_shoulder",
+        base_scenario = "highway",
+        route_length  = 150,
+        spawn_index   = 9,           # matches CarlaEnv spawnpoint for "highway"
+        obstacles     = [
+            (40.0,  2.0, "vehicle.tesla.model3"),     # broken-down car on right shoulder
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_crossing_block",
+        base_scenario = "crossing",
+        route_length  = 120,
+        spawn_index   = 166,         # matches CarlaEnv spawnpoint for "crossing"
+        obstacles     = [
+            (25.0,  1.5, "vehicle.nissan.micra"),
+            (50.0, -1.5, "vehicle.audi.a2"),
+        ],
+        npc_autopilot = [
+            (70.0,  0.0, "vehicle.mini.cooperst"),    # slow autopilot vehicle to overtake
+        ],
+    ),
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 30 ADDITIONAL SCENARIOS
+    # Crash-NPC scenarios (15): a vehicle spawns ahead, immediately veers hard,
+    # and hits a wall/kerb — driver must navigate the wreck.
+    # Regular scenarios (15): varied static + slow-NPC configurations.
+    #
+    # spawn_index values match CarlaEnv's hardcoded spawnpoint per scenario:
+    #   intersection  → 8    traffic_low/high → 57
+    #   tunnel        → 78   roundabout       → 0
+    #   highway       → 9    crossing         → 166
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── crash-NPC 1–4 : Town01 / intersection ────────────────────────────────
+    MiniScenario(
+        name          = "town01_crash_veer_right",
+        base_scenario = "intersection",
+        route_length  = 100,
+        spawn_index   = 8,
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.tesla.model3",   0.9),   # spawns in lane, veers right off road
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_crash_veer_left",
+        base_scenario = "intersection",
+        route_length  = 100,
+        spawn_index   = 8,
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.audi.a2",        -0.9),  # spawns in lane, veers left into barrier
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_crash_with_parked",
+        base_scenario = "intersection",
+        route_length  = 110,
+        spawn_index   = 8,
+        obstacles     = [
+            (55.0,  1.5, "vehicle.nissan.micra"),           # parked car further ahead
+        ],
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.mini.cooperst",  0.85),  # crash blocks near lane; parked blocks far
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_crash_two_veers",
+        base_scenario = "intersection",
+        route_length  = 130,
+        spawn_index   = 8,
+        npc_crash     = [
+            (25.0,  0.0, "vehicle.citroen.c3",     0.9),   # first crash, veer right
+            (50.0,  0.0, "vehicle.volkswagen.t2",  -0.9),  # second crash, veer left
+        ],
+    ),
+
+    # ── crash-NPC 5–7 : Town02 / traffic_low & traffic_high ──────────────────
+    MiniScenario(
+        name          = "town02_crash_veer_right",
+        base_scenario = "traffic_low",
+        route_length  = 90,
+        spawn_index   = 57,
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.audi.a2",        0.9),
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_crash_veer_left",
+        base_scenario = "traffic_low",
+        route_length  = 90,
+        spawn_index   = 57,
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.nissan.micra",  -0.9),
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_crash_plus_slow_npc",
+        base_scenario = "traffic_high",
+        route_length  = 110,
+        spawn_index   = 57,
+        npc_autopilot = [
+            (60.0,  0.0, "vehicle.mini.cooperst"),          # slow vehicle further ahead
+        ],
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.citroen.c3",     0.85),  # crash blocks near lane
+        ],
+    ),
+
+    # ── crash-NPC 8–10 : Town03 / tunnel & roundabout ────────────────────────
+    MiniScenario(
+        name          = "town03_tunnel_crash_right",
+        base_scenario = "tunnel",
+        route_length  = 100,
+        spawn_index   = 78,
+        npc_crash     = [
+            (25.0,  0.0, "vehicle.tesla.model3",   0.9),   # veers into tunnel right wall
+        ],
+    ),
+    MiniScenario(
+        name          = "town03_tunnel_crash_left",
+        base_scenario = "tunnel",
+        route_length  = 100,
+        spawn_index   = 78,
+        npc_crash     = [
+            (25.0,  0.0, "vehicle.audi.a2",       -0.9),   # veers into tunnel left wall
+        ],
+    ),
+    MiniScenario(
+        name          = "town03_roundabout_crash",
+        base_scenario = "roundabout",
+        route_length  = 110,
+        spawn_index   = 0,
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.volkswagen.t2",  0.9),
+        ],
+    ),
+
+    # ── crash-NPC 11–13 : Town04 / highway & crossing ────────────────────────
+    MiniScenario(
+        name          = "town04_highway_crash_right",
+        base_scenario = "highway",
+        route_length  = 160,
+        spawn_index   = 9,
+        npc_crash     = [
+            (35.0,  0.0, "vehicle.tesla.model3",   0.9),   # veers off highway right shoulder
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_highway_crash_left",
+        base_scenario = "highway",
+        route_length  = 160,
+        spawn_index   = 9,
+        npc_crash     = [
+            (35.0,  0.0, "vehicle.mini.cooperst", -0.9),   # veers into highway median barrier
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_crossing_crash",
+        base_scenario = "crossing",
+        route_length  = 130,
+        spawn_index   = 166,
+        npc_crash     = [
+            (28.0,  0.0, "vehicle.nissan.micra",   0.9),
+        ],
+    ),
+
+    # ── crash-NPC 14–15 : multi-car pile-ups ─────────────────────────────────
+    MiniScenario(
+        name          = "town01_crash_pileup",
+        base_scenario = "intersection",
+        route_length  = 130,
+        spawn_index   = 8,
+        npc_crash     = [
+            (22.0,  0.0, "vehicle.citroen.c3",    0.85),   # first car clips right kerb
+            (35.0,  0.0, "vehicle.audi.a2",       -0.85),  # second car spins left
+            (48.0,  0.0, "vehicle.nissan.micra",   0.9),   # third car goes wide right
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_highway_pileup",
+        base_scenario = "highway",
+        route_length  = 180,
+        spawn_index   = 9,
+        npc_crash     = [
+            (30.0,  0.0, "vehicle.tesla.model3",   0.9),
+            (50.0,  0.0, "vehicle.volkswagen.t2", -0.85),
+        ],
+    ),
+
+    # ── regular 1–4 : Town01 / intersection ──────────────────────────────────
+    MiniScenario(
+        name          = "town01_four_obstacles",
+        base_scenario = "intersection",
+        route_length  = 130,
+        spawn_index   = 8,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.audi.a2"),
+            (20.0, -1.5, "vehicle.nissan.micra"),
+            (50.0,  1.5, "vehicle.citroen.c3"),
+            (50.0, -1.5, "vehicle.mini.cooperst"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_slow_traffic",
+        base_scenario = "intersection",
+        route_length  = 120,
+        spawn_index   = 8,
+        npc_autopilot = [
+            (35.0,  0.0, "vehicle.nissan.micra"),
+            (55.0,  0.0, "vehicle.citroen.c3"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_parked_plus_slow",
+        base_scenario = "intersection",
+        route_length  = 120,
+        spawn_index   = 8,
+        obstacles     = [
+            (22.0,  1.5, "vehicle.audi.a2"),
+            (45.0, -1.5, "vehicle.tesla.model3"),
+        ],
+        npc_autopilot = [
+            (65.0,  0.0, "vehicle.nissan.micra"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town01_close_pair",
+        base_scenario = "intersection",
+        route_length  = 90,
+        spawn_index   = 8,
+        obstacles     = [
+            (22.0,  1.4, "vehicle.mini.cooperst"),
+            (28.0, -1.4, "vehicle.citroen.c3"),    # close stagger — narrow corridor
+        ],
+    ),
+
+    # ── regular 5–8 : Town02 / traffic_low & traffic_high ────────────────────
+    MiniScenario(
+        name          = "town02_three_parked",
+        base_scenario = "traffic_low",
+        route_length  = 120,
+        spawn_index   = 57,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.audi.a2"),
+            (40.0, -1.5, "vehicle.volkswagen.t2"),
+            (60.0,  1.5, "vehicle.nissan.micra"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_slow_convoy",
+        base_scenario = "traffic_low",
+        route_length  = 100,
+        spawn_index   = 57,
+        npc_autopilot = [
+            (40.0,  0.0, "vehicle.mini.cooperst"),
+            (55.0,  0.0, "vehicle.citroen.c3"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_four_parked",
+        base_scenario = "traffic_high",
+        route_length  = 130,
+        spawn_index   = 57,
+        obstacles     = [
+            (18.0,  1.5, "vehicle.audi.a2"),
+            (35.0, -1.5, "vehicle.tesla.model3"),
+            (52.0,  1.5, "vehicle.nissan.micra"),
+            (69.0, -1.5, "vehicle.mini.cooperst"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town02_parked_plus_slow",
+        base_scenario = "traffic_high",
+        route_length  = 110,
+        spawn_index   = 57,
+        obstacles     = [
+            (22.0,  1.5, "vehicle.citroen.c3"),
+        ],
+        npc_autopilot = [
+            (50.0,  0.0, "vehicle.audi.a2"),
+            (65.0,  0.0, "vehicle.volkswagen.t2"),
+        ],
+    ),
+
+    # ── regular 9–11 : Town03 / tunnel & roundabout ───────────────────────────
+    MiniScenario(
+        name          = "town03_tunnel_double_park",
+        base_scenario = "tunnel",
+        route_length  = 100,
+        spawn_index   = 78,
+        obstacles     = [
+            (22.0,  1.5, "vehicle.nissan.micra"),
+            (44.0, -1.5, "vehicle.audi.a2"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town03_tunnel_slow_npc",
+        base_scenario = "tunnel",
+        route_length  = 100,
+        spawn_index   = 78,
+        obstacles     = [
+            (22.0,  1.5, "vehicle.citroen.c3"),
+        ],
+        npc_autopilot = [
+            (55.0,  0.0, "vehicle.mini.cooperst"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town03_roundabout_triple",
+        base_scenario = "roundabout",
+        route_length  = 120,
+        spawn_index   = 0,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.audi.a2"),
+            (40.0, -1.5, "vehicle.volkswagen.t2"),
+            (60.0,  1.5, "vehicle.nissan.micra"),
+        ],
+    ),
+
+    # ── regular 12–15 : Town04 / highway & crossing ───────────────────────────
+    MiniScenario(
+        name          = "town04_highway_shoulder_trio",
+        base_scenario = "highway",
+        route_length  = 160,
+        spawn_index   = 9,
+        obstacles     = [
+            (30.0,  2.0, "vehicle.tesla.model3"),
+            (60.0,  2.0, "vehicle.audi.a2"),
+            (90.0,  2.0, "vehicle.nissan.micra"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_highway_slow_traffic",
+        base_scenario = "highway",
+        route_length  = 160,
+        spawn_index   = 9,
+        npc_autopilot = [
+            (40.0,  0.0, "vehicle.mini.cooperst"),
+            (60.0,  0.0, "vehicle.citroen.c3"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_crossing_triple",
+        base_scenario = "crossing",
+        route_length  = 130,
+        spawn_index   = 166,
+        obstacles     = [
+            (20.0,  1.5, "vehicle.nissan.micra"),
+            (40.0, -1.5, "vehicle.audi.a2"),
+            (60.0,  1.5, "vehicle.volkswagen.t2"),
+        ],
+    ),
+    MiniScenario(
+        name          = "town04_crossing_parked_plus_slow",
+        base_scenario = "crossing",
+        route_length  = 130,
+        spawn_index   = 166,
+        obstacles     = [
+            (22.0,  1.5, "vehicle.citroen.c3"),
+            (45.0, -1.5, "vehicle.tesla.model3"),
+        ],
+        npc_autopilot = [
+            (65.0,  0.0, "vehicle.mini.cooperst"),
         ],
     ),
 ]
@@ -524,6 +1023,134 @@ def _spawn_scenario_obstacles(
 
     if spawned:
         world.tick()  # register all actors before the game loop starts  # type: ignore[union-attr]
+    return spawned
+
+
+def _spawn_npc_autopilot(
+    world:       object,
+    hero:        object,
+    scenario:    MiniScenario,
+    spawn_index: int = 8,
+) -> List[object]:
+    """Spawn slow-moving NPC vehicles with autopilot enabled.
+
+    Placed using the same forward/right offset system as static obstacles.
+    These vehicles drive under CARLA's built-in autopilot — their speed is
+    capped to 20 km/h via the traffic manager so the AV can easily overtake.
+    Returns the list of spawned actors so the caller can destroy them later.
+    """
+    if not scenario.npc_autopilot:
+        return []
+
+    pts   = world.get_map().get_spawn_points()  # type: ignore[union-attr]
+    tf    = pts[spawn_index % len(pts)]
+    yaw_r = math.radians(tf.rotation.yaw)
+    fwd_x, fwd_y =  math.cos(yaw_r),  math.sin(yaw_r)
+    rgt_x, rgt_y =  math.sin(yaw_r), -math.cos(yaw_r)
+
+    bp_lib  = world.get_blueprint_library()  # type: ignore[union-attr]
+    spawned: List[object] = []
+
+    try:
+        tm = world.get_trafficmanager()  # type: ignore[union-attr]
+        tm_port = tm.get_port()
+    except Exception:
+        tm      = None
+        tm_port = 8000
+
+    for fwd_m, right_m, bp_id in scenario.npc_autopilot:
+        try:
+            bp = bp_lib.find(bp_id)
+        except Exception:
+            print(f"[npc] Blueprint '{bp_id}' not found — skipping.")
+            continue
+
+        loc = carla.Location(
+            x = tf.location.x + fwd_m * fwd_x + right_m * rgt_x,
+            y = tf.location.y + fwd_m * fwd_y + right_m * rgt_y,
+            z = hero.get_location().z - 0.25,  # type: ignore[union-attr]
+        )
+        npc_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw))
+        actor  = world.try_spawn_actor(bp, npc_tf)  # type: ignore[union-attr]
+        if actor is not None:
+            actor.set_autopilot(True, tm_port)
+            if tm is not None:
+                tm.vehicle_percentage_speed_difference(actor, 70)  # 30% of speed limit ≈ slow
+                tm.auto_lane_change(actor, False)                  # stay in lane
+            spawned.append(actor)
+            print(f"[npc] Autopilot NPC '{bp_id}'  fwd={fwd_m}m  right={right_m}m  id={actor.id}")
+        else:
+            print(f"[npc] Could not spawn '{bp_id}' at fwd={fwd_m}m right={right_m}m — skipping.")
+
+    if spawned:
+        world.tick()  # type: ignore[union-attr]
+    return spawned
+
+
+def _spawn_npc_crash(
+    world:       object,
+    hero:        object,
+    scenario:    MiniScenario,
+    spawn_index: int = 8,
+) -> List[object]:
+    """Spawn vehicles that immediately veer off-road and crash.
+
+    Each vehicle is spawned with physics enabled, then a single
+    VehicleControl(throttle=0.7, steer=<steer>) is applied.  CARLA keeps that
+    control active on every subsequent tick until explicitly changed, so the
+    vehicle accelerates while turning hard, leaves the road, and hits a wall,
+    kerb, or barrier — creating a wreck the AV/human must steer around.
+
+    The veer starts the moment the game loop's first world.tick() fires, so
+    by the time either driver reaches the crash site (~2–5 s at normal speed)
+    the vehicle has already left the road.
+    """
+    if not scenario.npc_crash:
+        return []
+
+    pts   = world.get_map().get_spawn_points()  # type: ignore[union-attr]
+    tf    = pts[spawn_index % len(pts)]
+    yaw_r = math.radians(tf.rotation.yaw)
+    fwd_x, fwd_y =  math.cos(yaw_r),  math.sin(yaw_r)
+    rgt_x, rgt_y =  math.sin(yaw_r), -math.cos(yaw_r)
+
+    bp_lib  = world.get_blueprint_library()  # type: ignore[union-attr]
+    spawned: List[object] = []
+
+    for fwd_m, right_m, bp_id, steer in scenario.npc_crash:
+        try:
+            bp = bp_lib.find(bp_id)
+        except Exception:
+            print(f"[crash_npc] Blueprint '{bp_id}' not found — skipping.")
+            continue
+
+        loc = carla.Location(
+            x = tf.location.x + fwd_m * fwd_x + right_m * rgt_x,
+            y = tf.location.y + fwd_m * fwd_y + right_m * rgt_y,
+            z = hero.get_location().z - 0.25,  # type: ignore[union-attr]
+        )
+        npc_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw))
+        actor  = world.try_spawn_actor(bp, npc_tf)  # type: ignore[union-attr]
+        if actor is not None:
+            # Physics ON (do not freeze) — the vehicle must drive and crash.
+            # Autopilot OFF — we control it manually so it ignores the road.
+            actor.set_autopilot(False)
+            actor.apply_control(carla.VehicleControl(  # type: ignore[union-attr]
+                throttle=0.7,
+                steer=float(np.clip(steer, -1.0, 1.0)),
+                brake=0.0,
+                hand_brake=False,
+                reverse=False,
+            ))
+            spawned.append(actor)
+            dir_str = "right" if steer > 0 else "left"
+            print(f"[crash_npc] '{bp_id}'  fwd={fwd_m}m  right={right_m}m  "
+                  f"veer={dir_str}  id={actor.id}")
+        else:
+            print(f"[crash_npc] Could not spawn '{bp_id}' at fwd={fwd_m}m right={right_m}m — skipping.")
+
+    if spawned:
+        world.tick()  # type: ignore[union-attr]
     return spawned
 
 
@@ -924,9 +1551,24 @@ def run_av_episode(
         _av_world.tick()
 
     # Spawn scenario obstacles after world cleanup so they are not swept away.
+    # spawn_index is read from the scenario and MUST match the spawnpoint that
+    # CarlaEnv used above (see the scenarios table in carla_gym_env.py).  If they
+    # diverge, obstacles land off-route and neither the AV nor the human driver
+    # will encounter them.
     _obstacle_actors: List[object] = []
+    _npc_actors:      List[object] = []
     if mini_scenario is not None:
-        _obstacle_actors = _spawn_scenario_obstacles(_av_world, env.vehicle, mini_scenario, spawn_index=8)
+        _si = mini_scenario.spawn_index
+        _obstacle_actors = _spawn_scenario_obstacles(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
+        _npc_actors      = _spawn_npc_autopilot(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
+        _npc_actors     += _spawn_npc_crash(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
+
+    # Verify actors are live before the game loop starts.
+    _live_obstacles = [a for a in _obstacle_actors if a.is_alive]
+    _live_npcs      = [a for a in _npc_actors      if a.is_alive]
+    print(f"[av_run] Pre-loop actor check: "
+          f"{len(_live_obstacles)}/{len(_obstacle_actors)} obstacle(s) live, "
+          f"{len(_live_npcs)}/{len(_npc_actors)} NPC(s) live.")
 
     try:
         while not done:
@@ -969,7 +1611,7 @@ def run_av_episode(
                 print(f"  [av_run] t={sim_t:.1f}s  wp={steps[-1].wp_index}/{total}"
                       f"  speed={steps[-1].speed:.1f}m/s")
     finally:
-        for _obs in _obstacle_actors:
+        for _obs in _obstacle_actors + _npc_actors:
             try:
                 _obs.destroy()
             except Exception:
@@ -1017,16 +1659,21 @@ def run_human_episode(
         world.tick()
     print(f"[human_run] Cleared {len(_pre_clear)} actor(s) from map.")
 
-    hero      = _spawn_hero(world)
+    _si   = mini_scenario.spawn_index if mini_scenario is not None else 8
+    hero  = _spawn_hero(world, spawn_index=_si)
     regressor = HumanStyleRegressor()
     regressor.attach_collision_sensor(world, hero)
     world.tick()  # settle hero physics so get_location().z is accurate for obstacle z
     print("[human_run] Hero spawned and collision sensor attached.")
 
     _obstacle_actors: List[object] = []
+    _npc_actors:      List[object] = []
     if mini_scenario is not None:
-        _obstacle_actors = _spawn_scenario_obstacles(world, hero, mini_scenario, spawn_index=8)
-        print(f"[human_run] Scenario '{mini_scenario.name}' — {len(_obstacle_actors)} obstacle(s) spawned.")
+        _obstacle_actors = _spawn_scenario_obstacles(world, hero, mini_scenario, spawn_index=_si)
+        _npc_actors      = _spawn_npc_autopilot(world, hero, mini_scenario, spawn_index=_si)
+        _npc_actors     += _spawn_npc_crash(world, hero, mini_scenario, spawn_index=_si)
+        print(f"[human_run] Scenario '{mini_scenario.name}' — "
+              f"{len(_obstacle_actors)} obstacle(s), {len(_npc_actors)} NPC(s) spawned.")
 
     # ── Sample alert ONCE ─────────────────────────────────────────────────
     # Use the calibrated style profile as the initial state.  Since style is
@@ -1134,7 +1781,7 @@ def run_human_episode(
             ))
 
     finally:
-        for _obs in _obstacle_actors:
+        for _obs in _obstacle_actors + _npc_actors:
             try:
                 _obs.destroy()
             except Exception:
@@ -1248,12 +1895,12 @@ class AlertPipeline:
     # ── Run ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        target_map = _SCENARIO_MAPS.get(MINI_SCENARIOS[0].base_scenario, "Town01")
+        cal_map = _SCENARIO_MAPS.get(MINI_SCENARIOS[0].base_scenario, "Town01")
 
         # Phase 0 — calibration (once, before any scenario)
-        print(f"\n[pipeline] Starting calibration (map={target_map}) …")
+        print(f"\n[pipeline] Starting calibration (map={cal_map}) …")
         client, world = _connect(self.host, self.port, render=True)
-        world = _load_map(client, world, target_map)
+        world = _load_map(client, world, cal_map)
         try:
             self.style_profile = run_calibration(
                 client, world, self.calibration_duration)
@@ -1267,6 +1914,8 @@ class AlertPipeline:
             print(f"# SCENARIO {scenario_idx+1} / {len(MINI_SCENARIOS)}  —  {mini.name.upper()}")
             print(f"{'#'*60}")
 
+            scenario_map = _SCENARIO_MAPS.get(mini.base_scenario, "Town01")
+
             # Phase 1 — AV headless run with obstacles
             traj, av_steps = run_av_episode(
                 self.model_path, self.style_profile,
@@ -1277,7 +1926,7 @@ class AlertPipeline:
             # Phase 2 — human run with obstacles and alerts
             print(f"\n[pipeline] Re-enabling UE4 rendering for human run …")
             client, world = _connect(self.host, self.port, render=True)
-            world = _load_map(client, world, target_map)
+            world = _load_map(client, world, scenario_map)
             try:
                 step_log = run_human_episode(
                     client, world, traj, av_steps,
