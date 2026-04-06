@@ -99,6 +99,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import pickle
 import random
 import sys
 import time
@@ -127,9 +128,6 @@ for _p in [str(_SB3_ROOT), str(_THIS_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-print(f"[init] sb3 root : {_SB3_ROOT}")
-print(f"[init] run root : {_RUN_ROOT}  ({len(list(_RUN_ROOT.glob('*.zip')))} .zip files found)"
-      if _RUN_ROOT.exists() else f"[init] run root : {_RUN_ROOT}  (NOT FOUND)")
 
 # ── TYPE-CHECK-ONLY IMPORTS (no runtime cost, silences Pylance warnings) ──────
 if TYPE_CHECKING:
@@ -138,18 +136,14 @@ if TYPE_CHECKING:
 # ── CARLA ─────────────────────────────────────────────────────────────────────
 try:
     import carla  # type: ignore[import]
-    print("[init] CARLA Python API loaded.")
 except ImportError:
     carla = None  # type: ignore[assignment]
-    print("[init] WARNING: CARLA not found on sys.path.")
 
 # ── PYGAME (input only — no participant-facing window) ────────────────────────
 try:
     import pygame  # type: ignore[import]
-    print("[init] pygame loaded.")
 except ImportError:
     pygame = None  # type: ignore[assignment]
-    print("[init] CRITICAL: pygame not found. Install sb3/requirements.txt.")
 
 # ── PROJECT IMPORTS ───────────────────────────────────────────────────────────
 from steering_control import get_wheel_control, get_keyboard_control, ffb_init, ffb_shutdown  # noqa: E402
@@ -163,11 +157,9 @@ try:
     from config import Hyperparameters          # type: ignore[import]
     from pdmorl_train import PDMORL_TD3         # type: ignore[import]
     _SB3_OK = True
-    print("[init] sb3 modules loaded (CarlaEnv, PDMORL_TD3, CarlaEnvUtils).")
 except ImportError as _e:
     CarlaEnv = CarlaEnvUtils = Hyperparameters = PDMORL_TD3 = None  # type: ignore[assignment]
     _SB3_OK = False
-    print(f"[init] WARNING: sb3 unavailable ({_e}). AV phase will fail.")
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 STYLE_LABELS = ["speed", "efficiency", "aggressiveness", "comfort"]
@@ -194,7 +186,6 @@ def find_model(explicit_path: str = "") -> str:
         p = Path(explicit_path)
         if not p.exists():
             raise FileNotFoundError(f"Model not found: {p.resolve()}")
-        print(f"[model] Using explicit path: {p.resolve()}")
         return str(p.resolve())
 
     if not _RUN_ROOT.exists():
@@ -210,9 +201,6 @@ def find_model(explicit_path: str = "") -> str:
 
     # Prefer *bestCombined* if it exists
     best = next((z for z in zips if "bestCombined" in z.name), zips[0])
-    print(f"[model] Auto-selected model: {best}")
-    if best != zips[0]:
-        print(f"[model] (Most recent is {zips[0].name} — override with --model if needed)")
     return str(best)
 
 
@@ -851,11 +839,9 @@ class ControlReader:
         if pygame.joystick.get_count() > 0:
             self._wheel = pygame.joystick.Joystick(0)
             self._wheel.init()
-            print(f"[input] Steering wheel detected: {self._wheel.get_name()}")
-            print("[input]   Axis 0 = steering | Axis 1 = brake | Axis 3 = throttle")
-            # ffb_init() disabled — SDK init overrides G HUB spring settings even when FFB calls fail
+            pass  # ffb_init() disabled — SDK init overrides G HUB spring settings
         else:
-            print("[input] No wheel detected — keyboard fallback (W/A/S/D).")
+            pass
 
         self._control     = carla.VehicleControl()
         self._reverse     = False
@@ -873,13 +859,11 @@ class ControlReader:
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_r:
                     self._reverse = not self._reverse
-                    print(f"[input] Reverse: {self._reverse}")
                 if ev.key == pygame.K_q:
                     self.quit_request = True
             # G920 wheel: button 8 (left paddle shifter) toggles reverse
             if ev.type == pygame.JOYBUTTONDOWN and ev.button == 8:
                 self._reverse = not self._reverse
-                print(f"[input] Reverse (wheel button 8): {self._reverse}")
 
         if self._wheel is not None:
             get_wheel_control(self._wheel, self._control, self._reverse)
@@ -897,7 +881,6 @@ class ControlReader:
 # ── CARLA HELPERS ─────────────────────────────────────────────────────────────
 
 def _connect(host: str, port: int, render: bool = True) -> Tuple[object, object]:
-    print(f"[carla] Connecting to {host}:{port} …")
     client = carla.Client(host, port)
     client.set_timeout(30.0)
     world  = client.get_world()
@@ -906,22 +889,18 @@ def _connect(host: str, port: int, render: bool = True) -> Tuple[object, object]
     s.fixed_delta_seconds = _DT
     s.no_rendering_mode   = not render
     world.apply_settings(s)
-    print(f"[carla] Connected. Map: {world.get_map().name.split('/')[-1]}  "
-          f"render={'ON' if render else 'OFF'}")
     return client, world
 
 
 def _load_map(client: object, world: object, name: str) -> object:
     current = world.get_map().name.split("/")[-1]  # type: ignore[union-attr]
     if current != name:
-        print(f"[carla] Loading map {name} (was {current}) …")
         world = client.load_world(name)  # type: ignore[union-attr]
         s = world.get_settings()  # type: ignore[union-attr]
         s.synchronous_mode    = True
         s.fixed_delta_seconds = _DT
         s.no_rendering_mode   = False
         world.apply_settings(s)  # type: ignore[union-attr]
-        print(f"[carla] Map {name} loaded.")
     return world
 
 
@@ -929,7 +908,6 @@ def _disconnect(world: object) -> None:
     s = world.get_settings()  # type: ignore[union-attr]
     s.synchronous_mode = False
     world.apply_settings(s)  # type: ignore[union-attr]
-    print("[carla] Disconnected (synchronous mode off).")
 
 
 def _spectator_follow(world: object, vehicle: object) -> None:
@@ -967,7 +945,6 @@ def _spawn_hero(world: object, spawn_index: int = 8) -> object:
     for idx in indices:
         v = world.try_spawn_actor(bp, pts[idx])  # type: ignore[union-attr]
         if v is not None:
-            print(f"[spawn] Hero spawned at spawn point {idx}.")
             return v
     raise RuntimeError("Could not spawn hero at any spawn point — all occupied.")
 
@@ -1000,7 +977,6 @@ def _spawn_scenario_obstacles(
         try:
             bp = bp_lib.find(bp_id)
         except Exception:
-            print(f"[obstacles] Blueprint '{bp_id}' not found — skipping.")
             continue
 
         # Use the hero's *actual* location z (post-physics settle) rather than the
@@ -1018,9 +994,6 @@ def _spawn_scenario_obstacles(
         if actor is not None:
             actor.set_simulate_physics(False)   # freeze immediately — no drift or fall
             spawned.append(actor)
-            print(f"[obstacles] Spawned '{bp_id}'  fwd={fwd_m}m  right={right_m}m  z={loc.z:.2f}  id={actor.id}")
-        else:
-            print(f"[obstacles] Could not spawn '{bp_id}' at fwd={fwd_m}m right={right_m}m — position occupied.")
 
     if spawned:
         world.tick()  # register all actors before the game loop starts  # type: ignore[union-attr]
@@ -1063,7 +1036,6 @@ def _spawn_npc_autopilot(
         try:
             bp = bp_lib.find(bp_id)
         except Exception:
-            print(f"[npc] Blueprint '{bp_id}' not found — skipping.")
             continue
 
         loc = carla.Location(
@@ -1079,9 +1051,6 @@ def _spawn_npc_autopilot(
                 tm.vehicle_percentage_speed_difference(actor, 70)  # 30% of speed limit ≈ slow
                 tm.auto_lane_change(actor, False)                  # stay in lane
             spawned.append(actor)
-            print(f"[npc] Autopilot NPC '{bp_id}'  fwd={fwd_m}m  right={right_m}m  id={actor.id}")
-        else:
-            print(f"[npc] Could not spawn '{bp_id}' at fwd={fwd_m}m right={right_m}m — skipping.")
 
     if spawned:
         world.tick()  # type: ignore[union-attr]
@@ -1122,7 +1091,6 @@ def _spawn_npc_crash(
         try:
             bp = bp_lib.find(bp_id)
         except Exception:
-            print(f"[crash_npc] Blueprint '{bp_id}' not found — skipping.")
             continue
 
         loc = carla.Location(
@@ -1144,11 +1112,6 @@ def _spawn_npc_crash(
                 reverse=False,
             ))
             spawned.append(actor)
-            dir_str = "right" if steer > 0 else "left"
-            print(f"[crash_npc] '{bp_id}'  fwd={fwd_m}m  right={right_m}m  "
-                  f"veer={dir_str}  id={actor.id}")
-        else:
-            print(f"[crash_npc] Could not spawn '{bp_id}' at fwd={fwd_m}m right={right_m}m — skipping.")
 
     if spawned:
         world.tick()  # type: ignore[union-attr]
@@ -1170,6 +1133,68 @@ def _dist_color(dist_m: float, colorblind: bool = False) -> Tuple[int, int, int]
 
 # Module-level sound cooldown (reset at episode start)
 _last_sound_t: float = -999.0
+
+
+def _draw_av_dot(world: object, traj: AVTrajectory, sim_time: float) -> None:
+    """Test mode: draw a red dot at the AV's current position plus fading lookahead dots."""
+    pos = traj.get_position_at(sim_time)
+    if pos is None:
+        return
+    world.debug.draw_point(  # type: ignore[union-attr]
+        carla.Location(x=pos[0], y=pos[1], z=pos[2] + 0.5),
+        size=0.3,
+        color=carla.Color(r=255, g=40, b=40),
+        life_time=_DRAW_LT,
+    )
+    for look, sz in ((1.0, 0.2), (2.0, 0.15), (3.0, 0.1)):
+        future = traj.get_position_at(sim_time + look)
+        if future is not None:
+            world.debug.draw_point(  # type: ignore[union-attr]
+                carla.Location(x=future[0], y=future[1], z=future[2] + 0.5),
+                size=sz,
+                color=carla.Color(r=255, g=160, b=40),
+                life_time=_DRAW_LT,
+            )
+
+
+def _show_score_between(
+    world:           object,
+    scenario_name:   str,
+    iteration:       int,
+    av_score:        float,
+    alignment_score: float,
+    duration:        float = 4.0,
+) -> None:
+    """Display a score summary centered in the spectator view for `duration` seconds."""
+    clock  = pygame.time.Clock()
+    start  = time.time()
+    lines  = [
+        f"== SCENARIO {iteration} COMPLETE ==",
+        f"Scenario  : {scenario_name}",
+        f"AV Score  : {av_score:.2f}",
+        f"Alignment : {alignment_score:.2f}",
+    ]
+    while time.time() - start < duration:
+        remaining = max(0.0, duration - (time.time() - start))
+        display   = lines + [f"Next in {remaining:.0f}s ..."]
+
+        # Re-sample spectator each tick so text stays fixed to the view
+        sp_tf = world.get_spectator().get_transform()  # type: ignore[union-attr]
+        fwd   = sp_tf.get_forward_vector()
+        # Place anchor 6 m ahead of spectator in the direction it is looking
+        ax = sp_tf.location.x + 6.0 * fwd.x
+        ay = sp_tf.location.y + 6.0 * fwd.y
+        az = sp_tf.location.z + 6.0 * fwd.z
+
+        for i, line in enumerate(display):
+            world.debug.draw_string(  # type: ignore[union-attr]
+                location=carla.Location(x=ax, y=ay, z=az - i * 0.7),
+                text=line,
+                color=carla.Color(r=255, g=255, b=80),
+                life_time=_DRAW_LT * 2,
+            )
+        world.tick()  # type: ignore[union-attr]
+        clock.tick(FPS)
 
 
 def draw_alert(
@@ -1369,6 +1394,150 @@ def _nearest_av(steps: List[AVStepData], t: float) -> AVStepData:
     return steps[lo]
 
 
+# ── TUTORIAL ──────────────────────────────────────────────────────────────────
+
+# Each stage: (start_second, headline, detail_lines)
+_TUTORIAL_STAGES = [
+    (0,  "WELCOME — LEARN THE CONTROLS",
+         ["You are about to drive a real simulation.",
+          "Each control below maps to your physical hardware.",
+          "Practice freely — the car won't be judged yet.",
+          "The tutorial lasts about 90 seconds."]),
+    (18, "RIGHT PEDAL  =  THROTTLE / GAS",
+         ["Press the RIGHT pedal to accelerate.",
+          "Release it fully to coast.",
+          "Try pressing it now and drive forward!"]),
+    (36, "MIDDLE PEDAL  =  BRAKE",
+         ["Press the MIDDLE pedal to slow down or stop.",
+          "Hold it to come to a complete stop.",
+          "Try braking from speed — feel the response."]),
+    (54, "STEERING WHEEL  =  STEER",
+         ["Turn the wheel left or right to steer the car.",
+          "Small inputs = gentle lane changes.",
+          "Try a smooth left turn, then a right turn."]),
+    (72, "RSB BUTTON  =  REVERSE MODE",
+         ["Press RSB (right shoulder button) to enter REVERSE.",
+          "Press RSB again to return to FORWARD.",
+          "In reverse: gas pedal drives you backward.",
+          "Try reversing, then come back to forward."]),
+]
+_TUTORIAL_DURATION = 90  # seconds
+
+
+def run_tutorial(_client: object, world: object) -> None:
+    """Interactive control tutorial shown before calibration.
+
+    The hero car is spawned and fully driveable throughout.
+    Stage text is displayed in the UE4 window anchored to the spectator,
+    cycling through each control every ~18 seconds.
+    """
+    print(f"\n{'='*60}")
+    print(f"TUTORIAL  ({_TUTORIAL_DURATION}s)  — teaching controls")
+    print(f"{'='*60}")
+
+    # Clear any leftover actors
+    _tut_clear = [
+        a for a in world.get_actors()  # type: ignore[union-attr]
+        if a.type_id.startswith("vehicle.") or a.type_id.startswith("walker.")
+    ]
+    for _a in _tut_clear:
+        _a.destroy()
+    if _tut_clear:
+        world.tick()  # type: ignore[union-attr]
+
+    hero        = _spawn_hero(world)
+    ctrl_reader = ControlReader()
+    clock       = pygame.time.Clock()
+    start_t     = time.time()
+
+    # All control lines shown as a persistent reminder (dim white)
+    _all_controls = [
+        "RIGHT pedal  =  Throttle / Gas",
+        "MIDDLE pedal =  Brake",
+        "Steering Wheel  =  Steer",
+        "RSB button  =  Reverse / Forward",
+    ]
+
+    try:
+        while True:
+            elapsed   = time.time() - start_t
+            remaining = int(_TUTORIAL_DURATION - elapsed)
+            if remaining <= 0 or ctrl_reader.quit_request:
+                break
+
+            ctrl = ctrl_reader.read()
+            hero.apply_control(ctrl)
+            world.tick()  # type: ignore[union-attr]
+            clock.tick(FPS)
+            _spectator_follow(world, hero)
+
+            # Determine which stage is active
+            stage_idx = 0
+            for _si, _stage in enumerate(_TUTORIAL_STAGES):
+                if elapsed >= _stage[0]:
+                    stage_idx = _si
+
+            headline, detail_lines = _TUTORIAL_STAGES[stage_idx][1], _TUTORIAL_STAGES[stage_idx][2]
+
+            # ── Anchor text in front of spectator (center-screen) ──────────
+            sp_tf = world.get_spectator().get_transform()  # type: ignore[union-attr]
+            fwd   = sp_tf.get_forward_vector()
+            ax = sp_tf.location.x + 6.0 * fwd.x
+            ay = sp_tf.location.y + 6.0 * fwd.y
+            az = sp_tf.location.z + 6.0 * fwd.z
+
+            # Countdown + reverse indicator (top line)
+            rev_tag = "  [ REVERSE ]" if ctrl_reader.reverse else ""
+            world.debug.draw_string(  # type: ignore[union-attr]
+                location=carla.Location(x=ax, y=ay, z=az + 2.5),
+                text=f"TUTORIAL  {remaining}s remaining{rev_tag}",
+                color=carla.Color(r=180, g=180, b=180),
+                life_time=_DRAW_LT * 2,
+            )
+
+            # Active stage headline (bright yellow, large)
+            world.debug.draw_string(  # type: ignore[union-attr]
+                location=carla.Location(x=ax, y=ay, z=az + 1.6),
+                text=f">>> {headline} <<<",
+                color=carla.Color(r=255, g=240, b=0),
+                life_time=_DRAW_LT * 2,
+            )
+
+            # Detail lines for the active stage (white)
+            for _li, _dl_line in enumerate(detail_lines):
+                world.debug.draw_string(  # type: ignore[union-attr]
+                    location=carla.Location(x=ax, y=ay, z=az + 0.8 - _li * 0.65),
+                    text=_dl_line,
+                    color=carla.Color(r=230, g=230, b=230),
+                    life_time=_DRAW_LT * 2,
+                )
+
+            # All-controls reminder at the bottom (dim grey)
+            base_z = az + 0.8 - len(detail_lines) * 0.65 - 0.5
+            world.debug.draw_string(  # type: ignore[union-attr]
+                location=carla.Location(x=ax, y=ay, z=base_z),
+                text="── All controls ──",
+                color=carla.Color(r=120, g=120, b=120),
+                life_time=_DRAW_LT * 2,
+            )
+            for _ci, _ctrl_line in enumerate(_all_controls):
+                # Highlight the active control in the summary too
+                _active = (stage_idx > 0 and _ci == stage_idx - 1)
+                world.debug.draw_string(  # type: ignore[union-attr]
+                    location=carla.Location(x=ax, y=ay, z=base_z - 0.55 - _ci * 0.55),
+                    text=("* " if _active else "  ") + _ctrl_line,
+                    color=(carla.Color(r=255, g=220, b=80)
+                           if _active else carla.Color(r=110, g=110, b=110)),
+                    life_time=_DRAW_LT * 2,
+                )
+
+    finally:
+        ctrl_reader.close()
+        hero.destroy()
+
+    print(f"[tutorial] Done ({_TUTORIAL_DURATION}s).")
+
+
 # ── PHASE 0: CALIBRATION ──────────────────────────────────────────────────────
 
 def run_calibration(
@@ -1393,12 +1562,10 @@ def run_calibration(
         _a.destroy()
     if _cal_clear:
         world.tick()
-    print(f"[calibration] Cleared {len(_cal_clear)} NPC actor(s) from map.")
 
     hero      = _spawn_hero(world)
     regressor = HumanStyleRegressor()
     regressor.attach_collision_sensor(world, hero)
-    print("[calibration] Collision sensor attached.")
 
     ctrl_reader = ControlReader()
     clock   = pygame.time.Clock()
@@ -1446,7 +1613,6 @@ def run_calibration(
         ctrl_reader.close()
         regressor.destroy_collision_sensor()
         hero.destroy()
-        print("[calibration] Hero destroyed.")
 
     profile = regressor.get_style_profile()
     print(f"\n[calibration] DONE → "
@@ -1476,14 +1642,15 @@ def run_av_episode(
     print("         UE4 window will go dark — this is normal.")
     print(f"{'='*60}")
 
-    config                       = Hyperparameters()
-    config.scenario              = scenario
-    config.next_map              = _SCENARIO_MAPS.get(scenario, "Town01")
-    config.evaluate              = True
-    config.client_port           = port
+    config                        = Hyperparameters()
+    config.scenario               = scenario
+    config.next_map               = _SCENARIO_MAPS.get(scenario, "Town01")
+    config.evaluate               = True
+    config.evaluate_scenarios     = False        # use participant/training routes, not evaluation ones
+    config.training_scenarios     = [scenario]   # route type matches the mini scenario being pre-run
+    config.client_port            = port
     config.SPECATE                = True    # keep rendering ON so camera produces real images for the model
     config.waypoint_timeout_ticks = 10_000  # ~500 s at 20 FPS — lets AV finish full route
-    config.NUM_TRAFFIC_VEHICLES   = 0       # no NPC traffic during AV phase
 
     _av_client = carla.Client("localhost", port)
     _av_client.set_timeout(30.0)
@@ -1493,7 +1660,6 @@ def run_av_episode(
     _av_world = _av_client.get_world()
     _leftover = list(_av_world.get_actors().filter("vehicle.*"))
     if _leftover:
-        print(f"[av_run] Destroying {len(_leftover)} leftover vehicle(s) before AV start.")
         for _a in _leftover:
             _a.destroy()
         _av_world.tick()
@@ -1509,10 +1675,8 @@ def run_av_episode(
     env.pref_weights_round    = _w
     env.get_pref_weights      = lambda: None      # no-op; preserves _w set above
     env.get_pref_weights_step = lambda: _w.copy()
-    print(f"[av_run] Preference weights injected: {_w.tolist()}")
 
     model = PDMORL_TD3.load(model_path)
-    print(f"[av_run] Model loaded: {model_path}")
 
     traj:  AVTrajectory     = AVTrajectory()
     steps: List[AVStepData] = []
@@ -1530,10 +1694,7 @@ def run_av_episode(
         # bounds (including a target_wp_ahead lookahead), so it must match the
         # truncated route length minus the lookahead to stay in bounds.
         env.config.max_waypoints = len(env.route) - env.config.target_wp_ahead
-        print(f"[av_run] Route truncated to {len(env.route)} waypoints "
-              f"(max_waypoints set to {env.config.max_waypoints}) for scenario '{mini_scenario.name}'.")
     total  = max(len(env.route), 1)
-    print(f"[av_run] Environment reset. Route: {total} waypoints.")
 
     # After the map loads, purge every vehicle and walker except the AV hero.
     # This removes static parked-car props that are baked into the map and would
@@ -1546,7 +1707,6 @@ def run_av_episode(
         and a.id != _hero_id
     ]
     if _to_destroy:
-        print(f"[av_run] Removing {len(_to_destroy)} static/NPC actor(s) from map.")
         for _a in _to_destroy:
             _a.destroy()
         _av_world.tick()
@@ -1564,12 +1724,6 @@ def run_av_episode(
         _npc_actors      = _spawn_npc_autopilot(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
         _npc_actors     += _spawn_npc_crash(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
 
-    # Verify actors are live before the game loop starts.
-    _live_obstacles = [a for a in _obstacle_actors if a.is_alive]
-    _live_npcs      = [a for a in _npc_actors      if a.is_alive]
-    print(f"[av_run] Pre-loop actor check: "
-          f"{len(_live_obstacles)}/{len(_obstacle_actors)} obstacle(s) live, "
-          f"{len(_live_npcs)}/{len(_npc_actors)} NPC(s) live.")
 
     _av_driving_score = 0.0
     _speed_print_time = time.time()
@@ -1629,7 +1783,6 @@ def run_av_episode(
             except Exception:
                 pass
         env.close()
-        print("[av_run] CarlaEnv closed.")
 
     prog = steps[-1].progress() * 100 if steps else 0.0
     print(f"\n[av_run] DONE → {len(steps)} steps, route completion {prog:.1f}%")
@@ -1647,6 +1800,7 @@ def run_human_episode(
     alert_model:   MoEAlertModel,
     max_duration:  float = 300.0,
     force_arrow:   bool  = False,
+    test_mode:     bool  = False,
     mini_scenario: Optional[MiniScenario] = None,
 ) -> List[HumanStepData]:
     """Human drives with alert overlays drawn into the UE4 window.
@@ -1669,14 +1823,12 @@ def run_human_episode(
         _a.destroy()
     if _pre_clear:
         world.tick()
-    print(f"[human_run] Cleared {len(_pre_clear)} actor(s) from map.")
 
     _si   = mini_scenario.spawn_index if mini_scenario is not None else 8
     hero  = _spawn_hero(world, spawn_index=_si)
     regressor = HumanStyleRegressor()
     regressor.attach_collision_sensor(world, hero)
     world.tick()  # settle hero physics so get_location().z is accurate for obstacle z
-    print("[human_run] Hero spawned and collision sensor attached.")
 
     _obstacle_actors: List[object] = []
     _npc_actors:      List[object] = []
@@ -1684,8 +1836,6 @@ def run_human_episode(
         _obstacle_actors = _spawn_scenario_obstacles(world, hero, mini_scenario, spawn_index=_si)
         _npc_actors      = _spawn_npc_autopilot(world, hero, mini_scenario, spawn_index=_si)
         _npc_actors     += _spawn_npc_crash(world, hero, mini_scenario, spawn_index=_si)
-        print(f"[human_run] Scenario '{mini_scenario.name}' — "
-              f"{len(_obstacle_actors)} obstacle(s), {len(_npc_actors)} NPC(s) spawned.")
 
     # ── Sample alert ONCE ─────────────────────────────────────────────────
     # Use the calibrated style profile as the initial state.  Since style is
@@ -1757,7 +1907,10 @@ def run_human_episode(
             score = _deviation_score(human_style, av_style)
 
             # ── CARLA debug rendering ─────────────────────────────────────
-            draw_alert(world, alert, hero, traj, sim_t)
+            if test_mode:
+                _draw_av_dot(world, traj, sim_t)
+            else:
+                draw_alert(world, alert, hero, traj, sim_t)
             _spectator_follow(world, hero)
 
             loc = hero.get_location()
@@ -1857,7 +2010,11 @@ class AlertPipeline:
         save_dir:             str   = "./pipeline_runs",
         participant_number:   int   = 0,
         session_duration:     float = 25 * 60,
+        alert_mode:           str   = "adaptive",
+        av_speedup:           float = 2.0,
     ) -> None:
+        if alert_mode not in ("fixed", "adaptive", "test"):
+            raise ValueError(f"alert_mode must be 'fixed', 'adaptive', or 'test', got {alert_mode!r}")
         self.model_path           = model_path
         self.scenario             = scenario
         self.calibration_duration = calibration_duration
@@ -1868,6 +2025,8 @@ class AlertPipeline:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.participant_number   = participant_number
         self.session_duration     = session_duration
+        self.alert_mode           = alert_mode
+        self.av_speedup           = av_speedup
 
         self.alert_model    = MoEAlertModel(state_dim=DEFAULT_STATE_DIM)
         self.style_profile: Optional[np.ndarray] = None
@@ -1919,73 +2078,122 @@ class AlertPipeline:
     # ── Run ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        cal_map = _SCENARIO_MAPS.get(MINI_SCENARIOS[0].base_scenario, "Town01")
+        # ── Phase -1: Pre-run every scenario's AV trajectory (cached to disk) ──
+        # This is done ONCE before calibration so the main session loop never
+        # has to wait for an AV run.  The cache is keyed by speedup factor so
+        # changing --av-speedup invalidates the old cache automatically.
+        _cache_path = self.save_dir / f"av_prerun_spd{self.av_speedup:.2f}.pkl"
+        if _cache_path.exists():
+            with open(_cache_path, "rb") as _f:
+                _prerun_cache: List[tuple] = pickle.load(_f)
+            print(f"[pipeline] Loaded {len(_prerun_cache)} pre-run trajectories from cache.")
+        else:
+            _default_style = np.array([0.6, 0.2, 0.1, 0.1], dtype=np.float32)
+            _prerun_cache  = []
+            print(f"\n[pipeline] Pre-running {len(MINI_SCENARIOS)} AV scenarios "
+                  f"(speedup={self.av_speedup:.1f}x) …")
+            for _i, _ms in enumerate(MINI_SCENARIOS):
+                print(f"  [{_i+1}/{len(MINI_SCENARIOS)}] {_ms.name}")
+                try:
+                    _traj, _av_st, _av_sc = run_av_episode(
+                        self.model_path, _default_style, _ms.base_scenario, self.port,
+                        mini_scenario=_ms,
+                    )
+                    for _pt in _traj._points:
+                        _pt.t /= self.av_speedup
+                    for _st in _av_st:
+                        _st.sim_time /= self.av_speedup
+                    _prerun_cache.append((_ms, _traj, _av_st, _av_sc))
+                except Exception:
+                    import traceback
+                    print(f"  WARNING: {_ms.name} pre-run failed — skipped.\n"
+                          + traceback.format_exc())
+            with open(_cache_path, "wb") as _f:
+                pickle.dump(_prerun_cache, _f)
+            print(f"[pipeline] {len(_prerun_cache)}/{len(MINI_SCENARIOS)} scenarios cached.")
 
-        # Phase 0 — calibration (once, before any scenario)
-        print(f"\n[pipeline] Starting calibration (map={cal_map}) …")
+        if not _prerun_cache:
+            raise RuntimeError("No AV scenarios pre-computed successfully — cannot continue.")
+
+        # ── Phase 0: Calibration ──────────────────────────────────────────────
+        cal_map = _SCENARIO_MAPS.get(MINI_SCENARIOS[0].base_scenario, "Town01")
         client, world = _connect(self.host, self.port, render=True)
         world = _load_map(client, world, cal_map)
         try:
-            self.style_profile = run_calibration(
-                client, world, self.calibration_duration)
+            run_tutorial(client, world)
+            print(f"\n[pipeline] Starting calibration ({self.calibration_duration}s) …")
+            self.style_profile = run_calibration(client, world, self.calibration_duration)
         finally:
             _disconnect(world)
         print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
 
-        # Scenario loop — randomly pick scenarios until 25-minute session ends
-        session_end = time.time() + self.session_duration
+        # ── Scenario loop ─────────────────────────────────────────────────────
+        # Randomly pick from pre-computed trajectories.  Only human-drive time
+        # counts against the session clock.
+        print(f"\n[pipeline] Alert mode: {self.alert_mode.upper()}")
+        print(f"[pipeline] Session: {self.session_duration/60:.1f} min of human drive time")
+        session_human_elapsed = 0.0
         scenario_idx = 0
-        while time.time() < session_end:
-            elapsed_min = (time.time() - (session_end - self.session_duration)) / 60
-            remaining_min = (session_end - time.time()) / 60
-            mini = random.choice(MINI_SCENARIOS)
-            scenario_map = _SCENARIO_MAPS.get(mini.base_scenario, "Town01")
+        while session_human_elapsed < self.session_duration:
+            elapsed_min   = session_human_elapsed / 60
+            remaining_min = (self.session_duration - session_human_elapsed) / 60
+            mini, traj, av_steps, av_driving_score = random.choice(_prerun_cache)
+            scenario_map  = _SCENARIO_MAPS.get(mini.base_scenario, "Town01")
 
             print(f"\n{'#'*60}")
             print(f"# ITERATION {scenario_idx+1}  —  {mini.name.upper()}")
-            print(f"# Elapsed: {elapsed_min:.1f} min  |  Remaining: {remaining_min:.1f} min")
+            print(f"# Alert mode : {self.alert_mode.upper()}")
+            print(f"# Driven     : {elapsed_min:.1f} min  |  Remaining: {remaining_min:.1f} min")
             print(f"{'#'*60}")
 
-            scenario_map = _SCENARIO_MAPS.get(mini.base_scenario, "Town01")
-
-            # Phase 1 — AV headless run with obstacles
-            traj, av_steps, av_driving_score = run_av_episode(
-                self.model_path, self.style_profile,
-                mini.base_scenario, self.port,
-                mini_scenario=mini,
-            )
-
-            # Phase 2 — human run with obstacles and alerts
-            print(f"\n[pipeline] Re-enabling UE4 rendering for human run …")
-            client, world = _connect(self.host, self.port, render=True)
-            world = _load_map(client, world, scenario_map)
             try:
-                step_log = run_human_episode(
-                    client, world, traj, av_steps,
-                    self.style_profile, self.alert_model,
-                    force_arrow=(scenario_idx == 0),
-                    mini_scenario=mini,
-                )
-            finally:
-                _disconnect(world)
+                # Phase 2 — human run (counted against session clock)
+                client, world = _connect(self.host, self.port, render=True)
+                world = _load_map(client, world, scenario_map)
+                _human_start = time.time()
+                try:
+                    step_log = run_human_episode(
+                        client, world, traj, av_steps,
+                        self.style_profile, self.alert_model,
+                        force_arrow=(self.alert_mode == "fixed"),
+                        test_mode=(self.alert_mode == "test"),
+                        mini_scenario=mini,
+                    )
+                    # Score display between scenarios (world still active)
+                    if step_log:
+                        _mean_align = float(np.mean([s.alert_score for s in step_log]))
+                        _show_score_between(
+                            world, mini.name, scenario_idx + 1,
+                            av_driving_score, _mean_align,
+                            duration=4.0,
+                        )
+                finally:
+                    _disconnect(world)
+                session_human_elapsed += time.time() - _human_start
 
-            # Phase 3 — train
-            loss = flush_training(self.alert_model, step_log)
-            self._loss_history.append(loss)
-            self._save_csv(step_log, scenario_idx)
-            self._save(scenario_idx)
-            with open(self._participant_csv, "a", newline="") as _f:
-                csv.writer(_f).writerow([
-                    self.participant_number, mini.name, scenario_idx,
-                    av_driving_score, loss,
-                ])
+                # Phase 3 — train
+                loss = flush_training(self.alert_model, step_log)
+                self._loss_history.append(loss)
+                self._save_csv(step_log, scenario_idx)
+                self._save(scenario_idx)
+                with open(self._participant_csv, "a", newline="") as _f:
+                    csv.writer(_f).writerow([
+                        self.participant_number, mini.name, scenario_idx,
+                        av_driving_score, loss,
+                    ])
 
-            print(f"\n[pipeline] Iteration {scenario_idx+1} ('{mini.name}') done.  "
-                  f"Loss={loss:.4f}  History={[f'{v:.4f}' for v in self._loss_history]}")
+                print(f"\n[pipeline] Iteration {scenario_idx+1} ('{mini.name}') done.  "
+                      f"Loss={loss:.4f}  History={[f'{v:.4f}' for v in self._loss_history]}")
+
+            except Exception:
+                import traceback
+                print(f"\n[pipeline] WARNING — iteration {scenario_idx+1} ('{mini.name}') "
+                      f"failed and will be skipped:\n{traceback.format_exc()}")
 
             scenario_idx += 1
 
-        print(f"\n[pipeline] 25-minute session complete after {scenario_idx} iteration(s).")
+        print(f"\n[pipeline] Session complete after {scenario_idx} iteration(s) "
+              f"({session_human_elapsed/60:.1f} min driven).")
 
 
 # ── SMOKE TEST (--test flag, no CARLA required) ───────────────────────────────
@@ -2074,6 +2282,12 @@ def main() -> None:
                    help="Participant ID — used to name the per-participant CSV log")
     p.add_argument("--session-duration", type=float, default=25.0,
                    help="Total session duration in minutes (default: 25)")
+    p.add_argument("--av-speedup", type=float, default=2.0,
+                   help="Multiply AV trajectory speed by this factor during human runs (default: 2.0)")
+    p.add_argument("--alert-mode", default="adaptive", choices=["fixed", "adaptive", "test"],
+                   help="'fixed' forces arrow alert every episode; "
+                        "'adaptive' lets the model sample the alert type; "
+                        "'test' shows a moving dot along the AV trajectory (no alert) (default: adaptive)")
     p.add_argument("--test", action="store_true",
                    help="Run smoke tests (no CARLA or model needed) then exit")
     args = p.parse_args()
@@ -2094,6 +2308,8 @@ def main() -> None:
         save_dir=args.save_dir,
         participant_number=args.participant_number,
         session_duration=args.session_duration * 60,
+        alert_mode=args.alert_mode,
+        av_speedup=args.av_speedup,
     ).run()
 
 

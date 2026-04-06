@@ -1,4 +1,1 @@
 participant_number,scenario,iteration,driving_score,episode_loss
-0,parked_right,0,0.89,-1.9639859003601252
-0,parked_left,1,0.89,-1.3731444809171887
-0,double_park,2,0.91,-1.233888416323397
