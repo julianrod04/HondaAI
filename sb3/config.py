@@ -33,9 +33,12 @@ class Hyperparameters:
 		self.fps = 20
 
 		# Scenario settings
+		self.pretrained_model_path = r"C:\Users\jdr5622\ECE 464H\HondaAI\run\pdmorl_Train_Session_2-16-2026_bestCombined"  # Path to pretrained model for fine-tuning. Empty string = train from scratch. Do NOT include .zip extension.
+
 		self.scenario = False # Can be: "intersection", "traffic_low", "traffic_high", "tunnel", "roundabout", "highway", "crossing", etc.
 		self.scenario_traffic = True  # Enable spawning traffic in scenarios
-		self.evaluate_scenarios = True  # Evaluate agent on predefined scenarios
+		self.evaluate_scenarios = False  # Evaluate agent on predefined scenarios
+		self.training_scenarios = ["traffic_low"]  # List of scenario names to train on (e.g. ["intersection", "highway", "highway_50mph"]). Empty = random town training.
 
 		# Reward parameters
 		self.target_speed_perc = 0.95
@@ -44,13 +47,13 @@ class Hyperparameters:
 		self.verbose = 0
 		self.tm_port = 8000  # Traffic manager port; can be overwritten
 		self.client_port = 2000  # CARLA client port; can be overwritten
-		self.evaluate = True  # Train or evaluate the agent
+		self.evaluate = False  # Train or evaluate the agent
 		self.showPolicy = True  # Evaluate policy performance with multiple weight samples
-		self.SPECATE = False  # Spectator follows the car; set False if rendering off-screen
+		self.SPECATE = True  # Spectator follows the car; set False if rendering off-screen
 		self.next_map = 'Town04'  # Initial map
 
 		# Replay buffer
-		self.REPLAY_BUFFER_SIZE = int(2e5)  # Large buffer; requires more memory
+		self.REPLAY_BUFFER_SIZE = int(2e4)  # Large buffer; requires more memory (Lowered from 2e5 to 2e4)
 
 		# PDMORL-specific parameters
 		self.key_steps = 0  # Number of steps for first phase # int(1e6)

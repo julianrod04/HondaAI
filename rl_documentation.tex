@@ -22,8 +22,9 @@ on our experiences
 
 \section{What Went Wrong}
 
-\subsection{Custom PPO vs SB3}
+\subsection{Switching our Project Foundation}
 \paragraph{}
+We initially began implementing the model described in “Implementing a Deep Reinforcement Learning Model for Autonomous Driving.” However, we later transitioned to the approach presented in “Multi-Objective Reinforcement Learning for Adaptable Personalized Autonomous Driving.” One factor in this decision was the difference in the maturity of the work: the newer paper was developed by faculty and PhD researchers, whereas the original implementation was produced by an undergraduate researcher. More importantly, the codebase associated with the newer paper was built using Stable Baselines3 and the Gymnasium environment interface, which provided a more standardized and structured reinforcement learning framework. In contrast, the earlier implementation relied on a more manual setup, making the training pipeline less clear and more difficult to integrate into our project. Additionally, the newer work already included style vectors and a training protocol for incorporating them into the learning process, which aligned directly with our goal of modeling different driving behaviors. The original paper did not include any mechanism for representing driving styles, making the newer framework a more suitable and extensible foundation for our system. Finally, the newer approach allowed us to adopt the TD3 (Twin Delayed Deep Deterministic Policy Gradient) algorithm instead of the PPO algorithm used in the original paper, providing a more modern off-policy method that is well-suited for continuous control tasks such as autonomous driving.
 
 \subsection{Driving Rules}
 \paragraph{}
