@@ -97,14 +97,15 @@ PIPELINE PHASES
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import math
-import pickle
+import os
 import random
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -166,7 +167,14 @@ STYLE_LABELS = ["speed", "efficiency", "aggressiveness", "comfort"]
 FPS          = 20
 _DT          = 1.0 / FPS
 _DRAW_LT     = _DT * 1.5          # debug draw lifetime — just over one tick
-_MAX_DIST_M  = 80.0               # distance at which colour gradient saturates
+_MAX_DIST_M  = 80.0               # distance used for vibration threshold scaling
+_COLOR_DIST_M = 30.0              # distance at which colour gradient fully saturates red
+_CAR_LENGTH_M        = 4.5        # approximate vehicle length (m)
+_CAR_WIDTH_M         = 2.0        # approximate vehicle width (m)
+_HALF_LANE_WIDTH     = 1.75       # m from lane centre to dashed line — min clearance from obstacle
+_WP_CLEAR_RADIUS     = _CAR_LENGTH_M * 2          # 9.0 m — hard zone: full peak offset applied here
+_WP_TRANSITION_MULT  = 3.5        # transition extends to this multiple of _WP_CLEAR_RADIUS (31.5 m)
+_DETOUR_PEAK_M       = 1.0        # peak lateral detour offset in metres (scene-by-scene tuning)
 _STORE_EVERY = 30                  # store one training sample every N ticks
 _CONV_THRESHOLD = 0.02            # loss plateau threshold for convergence
 _CONV_WINDOW    = 5               # iterations to average for convergence check
@@ -261,6 +269,9 @@ class MiniScenario:
     obstacles:     List[Tuple[float, float, str]]         = field(default_factory=list)
     npc_autopilot: List[Tuple[float, float, str]]         = field(default_factory=list)
     npc_crash:     List[Tuple[float, float, str, float]]  = field(default_factory=list)
+    detour_peak_m: Optional[float]                        = None  # overrides _DETOUR_PEAK_M when set
+    route_type:    Optional[str]                          = None  # "straight_left" / "line_then_left"
+    route_params:  Optional[dict]                         = None  # extra params for route_type
 
 
 # ── Original 3 scenarios (Town01, spawn 8) ────────────────────────────────────
@@ -278,16 +289,17 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "parked_right",
         base_scenario = "intersection",
-        route_length  = 80,
+        route_length  = 160,
         spawn_index   = 8,
         obstacles     = [
-            (20.0,  1.5, "vehicle.tesla.model3"),   # parked car on right side of lane
+            (20.0,  2.5, "vehicle.tesla.model3"),   # parked car 1 m further right
         ],
+        detour_peak_m = -0.5,  # 0.5 m to the right
     ),
     MiniScenario(
         name          = "parked_left",
         base_scenario = "intersection",
-        route_length  = 80,
+        route_length  = 160,
         spawn_index   = 8,
         obstacles     = [
             (20.0, -1.5, "vehicle.tesla.model3"),   # parked car on left side of lane
@@ -296,7 +308,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "double_park",
         base_scenario = "intersection",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 8,
         obstacles     = [
             (20.0,  1.5, "vehicle.tesla.model3"),   # right side 20 m ahead
@@ -308,50 +320,48 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town01_far_parked",
         base_scenario = "intersection",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 8,           # matches CarlaEnv spawnpoint for "intersection"
         obstacles     = [
-            (35.0,  1.5, "vehicle.nissan.micra"),    # single parked car further ahead
+            (78.0, -30.5, "vehicle.nissan.micra", -90),  # around corner, rotated 90° user-right
         ],
+        detour_peak_m = 0.0,   # no route shift — obstacle is far off road
     ),
     MiniScenario(
         name          = "town01_chicane",
         base_scenario = "intersection",
-        route_length  = 120,
+        route_length  = 240,
         spawn_index   = 8,
         obstacles     = [
-            (18.0,  1.5, "vehicle.audi.a2"),          # right  18 m
             (36.0, -1.5, "vehicle.mini.cooperst"),    # left   36 m
             (54.0,  1.5, "vehicle.citroen.c3"),       # right  54 m
+            (0, 0, "vehicle.nissan.micra", -90, 138.0, 1.5),  # absolute world coords, detour enabled
         ],
     ),
     MiniScenario(
         name          = "town01_tight_gap",
         base_scenario = "intersection",
-        route_length  = 90,
+        route_length  = 180,
         spawn_index   = 8,
-        obstacles     = [
-            (25.0,  1.2, "vehicle.tesla.model3"),     # right — gap is narrower
-            (25.0, -1.2, "vehicle.volkswagen.t2"),    # left  — both at same distance
-        ],
+        obstacles     = [],
+        route_type    = "line_then_left",
+        route_params  = {"target_y": 55.5, "turn_x": 100.0, "after_turn": "straight"},
     ),
     MiniScenario(
         name          = "town01_triple_stagger",
         base_scenario = "intersection",
-        route_length  = 130,
+        route_length  = 260,
         spawn_index   = 8,
-        obstacles     = [
-            (20.0,  1.5, "vehicle.nissan.micra"),
-            (40.0, -1.5, "vehicle.audi.a2"),
-            (60.0,  1.5, "vehicle.mini.cooperst"),
-        ],
+        obstacles     = [],
+        route_type    = "line_then_left",
+        route_params  = {"target_y": 55.5, "turn_x": 100.0},
     ),
 
     # ── new: Town02 variants (CarlaEnv spawnpoint=57 for "traffic_low/high") ────
     MiniScenario(
         name          = "town02_parked_right",
         base_scenario = "traffic_low",
-        route_length  = 80,
+        route_length  = 160,
         spawn_index   = 57,          # matches CarlaEnv spawnpoint for "traffic_low"
         obstacles     = [
             (22.0,  1.5, "vehicle.citroen.c3"),       # single parked car, right
@@ -360,65 +370,40 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town02_double_stagger",
         base_scenario = "traffic_low",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 57,
         obstacles     = [
             (20.0,  1.5, "vehicle.audi.a2"),
             (42.0, -1.5, "vehicle.tesla.model3"),
+            (0, 0, "vehicle.nissan.micra", 0, 174.4, 237.1, False, 0.2),  # absolute coords, z=0.2
+            (0, 0, "vehicle.tesla.model3", 0, 181.0, 308.0, False, 0.4),  # absolute coords, z=0.4
         ],
     ),
     MiniScenario(
         name          = "town02_slow_npc",
         base_scenario = "traffic_high",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 57,          # matches CarlaEnv spawnpoint for "traffic_high"
         obstacles     = [
             (22.0,  1.5, "vehicle.nissan.micra"),     # parked car forces lane change
+            (0, 0, "vehicle.tesla.model3",  0, 144.7, 236.6, False, 0.3),  # absolute coords
+            (0, 0, "vehicle.audi.a2",       0,  92.0, 306.0, False, 0.3),  # absolute coords
         ],
         npc_autopilot = [
             (55.0,  0.0, "vehicle.mini.cooperst"),    # slow-moving vehicle ahead on autopilot
         ],
     ),
 
-    # ── new: Town03 variants ───────────────────────────────────────────────────
-    MiniScenario(
-        name          = "town03_narrow_pass",
-        base_scenario = "tunnel",
-        route_length  = 90,
-        spawn_index   = 78,          # matches CarlaEnv spawnpoint for "tunnel"
-        obstacles     = [
-            (25.0,  1.0, "vehicle.audi.a2"),          # slightly into lane — tight squeeze
-        ],
-    ),
-    MiniScenario(
-        name          = "town03_roundabout_approach",
-        base_scenario = "roundabout",
-        route_length  = 110,
-        spawn_index   = 0,           # matches CarlaEnv spawnpoint for "roundabout"
-        obstacles     = [
-            (20.0,  1.5, "vehicle.citroen.c3"),
-            (40.0, -1.5, "vehicle.volkswagen.t2"),
-        ],
-    ),
 
     # ── new: Town04 variants ───────────────────────────────────────────────────
     MiniScenario(
-        name          = "town04_highway_shoulder",
-        base_scenario = "highway",
-        route_length  = 150,
-        spawn_index   = 9,           # matches CarlaEnv spawnpoint for "highway"
-        obstacles     = [
-            (40.0,  2.0, "vehicle.tesla.model3"),     # broken-down car on right shoulder
-        ],
-    ),
-    MiniScenario(
         name          = "town04_crossing_block",
         base_scenario = "crossing",
-        route_length  = 120,
+        route_length  = 160,
         spawn_index   = 166,         # matches CarlaEnv spawnpoint for "crossing"
         obstacles     = [
-            (25.0,  1.5, "vehicle.nissan.micra"),
-            (50.0, -1.5, "vehicle.audi.a2"),
+            (25.0,  1.5, "vehicle.nissan.micra",  0, None, None, False),  # spawn only, no detour
+            (50.0, -1.5, "vehicle.audi.a2",       0, None, None, False),  # spawn only, no detour
         ],
         npc_autopilot = [
             (70.0,  0.0, "vehicle.mini.cooperst"),    # slow autopilot vehicle to overtake
@@ -441,41 +426,42 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town01_crash_veer_right",
         base_scenario = "intersection",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 8,
         npc_crash     = [
-            (28.0,  0.0, "vehicle.tesla.model3",   0.9),   # spawns in lane, veers right off road
+            (48.0,  0.0, "vehicle.tesla.model3",   0.9),   # spawns in lane, veers right off road
         ],
     ),
     MiniScenario(
         name          = "town01_crash_veer_left",
         base_scenario = "intersection",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 8,
         npc_crash     = [
             (28.0,  0.0, "vehicle.audi.a2",        -0.9),  # spawns in lane, veers left into barrier
         ],
+        detour_peak_m = -0.5,
     ),
     MiniScenario(
         name          = "town01_crash_with_parked",
         base_scenario = "intersection",
-        route_length  = 110,
+        route_length  = 220,
         spawn_index   = 8,
         obstacles     = [
             (55.0,  1.5, "vehicle.nissan.micra"),           # parked car further ahead
         ],
         npc_crash     = [
-            (28.0,  0.0, "vehicle.mini.cooperst",  0.85),  # crash blocks near lane; parked blocks far
+            (28.0,  6.0, "vehicle.mini.cooperst",  0.85),  # crash blocks near lane; parked blocks far
         ],
     ),
     MiniScenario(
         name          = "town01_crash_two_veers",
         base_scenario = "intersection",
-        route_length  = 130,
+        route_length  = 260,
         spawn_index   = 8,
         npc_crash     = [
-            (25.0,  0.0, "vehicle.citroen.c3",     0.9),   # first crash, veer right
-            (50.0,  0.0, "vehicle.volkswagen.t2",  -0.9),  # second crash, veer left
+            (35.0,  0.0, "vehicle.citroen.c3",     0.9),   # first crash, veer right
+            (60.0,  0.0, "vehicle.volkswagen.t2",  -0.9),  # second crash, veer left
         ],
     ),
 
@@ -483,25 +469,25 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town02_crash_veer_right",
         base_scenario = "traffic_low",
-        route_length  = 90,
+        route_length  = 180,
         spawn_index   = 57,
         npc_crash     = [
-            (28.0,  0.0, "vehicle.audi.a2",        0.9),
+            (33.0,  0.0, "vehicle.audi.a2",        0.9),
         ],
     ),
     MiniScenario(
         name          = "town02_crash_veer_left",
         base_scenario = "traffic_low",
-        route_length  = 90,
+        route_length  = 180,
         spawn_index   = 57,
         npc_crash     = [
-            (28.0,  0.0, "vehicle.nissan.micra",  -0.9),
+            (0, 0, "vehicle.nissan.micra",  -0.9, 144.7, 236.6),
         ],
     ),
     MiniScenario(
         name          = "town02_crash_plus_slow_npc",
         base_scenario = "traffic_high",
-        route_length  = 110,
+        route_length  = 220,
         spawn_index   = 57,
         npc_autopilot = [
             (60.0,  0.0, "vehicle.mini.cooperst"),          # slow vehicle further ahead
@@ -511,58 +497,12 @@ MINI_SCENARIOS: List[MiniScenario] = [
         ],
     ),
 
-    # ── crash-NPC 8–10 : Town03 / tunnel & roundabout ────────────────────────
-    MiniScenario(
-        name          = "town03_tunnel_crash_right",
-        base_scenario = "tunnel",
-        route_length  = 100,
-        spawn_index   = 78,
-        npc_crash     = [
-            (25.0,  0.0, "vehicle.tesla.model3",   0.9),   # veers into tunnel right wall
-        ],
-    ),
-    MiniScenario(
-        name          = "town03_tunnel_crash_left",
-        base_scenario = "tunnel",
-        route_length  = 100,
-        spawn_index   = 78,
-        npc_crash     = [
-            (25.0,  0.0, "vehicle.audi.a2",       -0.9),   # veers into tunnel left wall
-        ],
-    ),
-    MiniScenario(
-        name          = "town03_roundabout_crash",
-        base_scenario = "roundabout",
-        route_length  = 110,
-        spawn_index   = 0,
-        npc_crash     = [
-            (28.0,  0.0, "vehicle.volkswagen.t2",  0.9),
-        ],
-    ),
 
-    # ── crash-NPC 11–13 : Town04 / highway & crossing ────────────────────────
-    MiniScenario(
-        name          = "town04_highway_crash_right",
-        base_scenario = "highway",
-        route_length  = 160,
-        spawn_index   = 9,
-        npc_crash     = [
-            (35.0,  0.0, "vehicle.tesla.model3",   0.9),   # veers off highway right shoulder
-        ],
-    ),
-    MiniScenario(
-        name          = "town04_highway_crash_left",
-        base_scenario = "highway",
-        route_length  = 160,
-        spawn_index   = 9,
-        npc_crash     = [
-            (35.0,  0.0, "vehicle.mini.cooperst", -0.9),   # veers into highway median barrier
-        ],
-    ),
+    # ── crash-NPC 11 : Town04 / crossing ─────────────────────────────────────
     MiniScenario(
         name          = "town04_crossing_crash",
         base_scenario = "crossing",
-        route_length  = 130,
+        route_length  = 160,
         spawn_index   = 166,
         npc_crash     = [
             (28.0,  0.0, "vehicle.nissan.micra",   0.9),
@@ -573,7 +513,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town01_crash_pileup",
         base_scenario = "intersection",
-        route_length  = 130,
+        route_length  = 260,
         spawn_index   = 8,
         npc_crash     = [
             (22.0,  0.0, "vehicle.citroen.c3",    0.85),   # first car clips right kerb
@@ -581,22 +521,12 @@ MINI_SCENARIOS: List[MiniScenario] = [
             (48.0,  0.0, "vehicle.nissan.micra",   0.9),   # third car goes wide right
         ],
     ),
-    MiniScenario(
-        name          = "town04_highway_pileup",
-        base_scenario = "highway",
-        route_length  = 180,
-        spawn_index   = 9,
-        npc_crash     = [
-            (30.0,  0.0, "vehicle.tesla.model3",   0.9),
-            (50.0,  0.0, "vehicle.volkswagen.t2", -0.85),
-        ],
-    ),
 
     # ── regular 1–4 : Town01 / intersection ──────────────────────────────────
     MiniScenario(
         name          = "town01_four_obstacles",
         base_scenario = "intersection",
-        route_length  = 130,
+        route_length  = 260,
         spawn_index   = 8,
         obstacles     = [
             (20.0,  1.5, "vehicle.audi.a2"),
@@ -608,7 +538,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town01_slow_traffic",
         base_scenario = "intersection",
-        route_length  = 120,
+        route_length  = 240,
         spawn_index   = 8,
         npc_autopilot = [
             (35.0,  0.0, "vehicle.nissan.micra"),
@@ -618,7 +548,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town01_parked_plus_slow",
         base_scenario = "intersection",
-        route_length  = 120,
+        route_length  = 240,
         spawn_index   = 8,
         obstacles     = [
             (22.0,  1.5, "vehicle.audi.a2"),
@@ -631,7 +561,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town01_close_pair",
         base_scenario = "intersection",
-        route_length  = 90,
+        route_length  = 180,
         spawn_index   = 8,
         obstacles     = [
             (22.0,  1.4, "vehicle.mini.cooperst"),
@@ -643,7 +573,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town02_three_parked",
         base_scenario = "traffic_low",
-        route_length  = 120,
+        route_length  = 240,
         spawn_index   = 57,
         obstacles     = [
             (20.0,  1.5, "vehicle.audi.a2"),
@@ -654,7 +584,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town02_slow_convoy",
         base_scenario = "traffic_low",
-        route_length  = 100,
+        route_length  = 200,
         spawn_index   = 57,
         npc_autopilot = [
             (40.0,  0.0, "vehicle.mini.cooperst"),
@@ -664,7 +594,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town02_four_parked",
         base_scenario = "traffic_high",
-        route_length  = 130,
+        route_length  = 260,
         spawn_index   = 57,
         obstacles     = [
             (18.0,  1.5, "vehicle.audi.a2"),
@@ -676,7 +606,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town02_parked_plus_slow",
         base_scenario = "traffic_high",
-        route_length  = 110,
+        route_length  = 220,
         spawn_index   = 57,
         obstacles     = [
             (22.0,  1.5, "vehicle.citroen.c3"),
@@ -687,67 +617,12 @@ MINI_SCENARIOS: List[MiniScenario] = [
         ],
     ),
 
-    # ── regular 9–11 : Town03 / tunnel & roundabout ───────────────────────────
-    MiniScenario(
-        name          = "town03_tunnel_double_park",
-        base_scenario = "tunnel",
-        route_length  = 100,
-        spawn_index   = 78,
-        obstacles     = [
-            (22.0,  1.5, "vehicle.nissan.micra"),
-            (44.0, -1.5, "vehicle.audi.a2"),
-        ],
-    ),
-    MiniScenario(
-        name          = "town03_tunnel_slow_npc",
-        base_scenario = "tunnel",
-        route_length  = 100,
-        spawn_index   = 78,
-        obstacles     = [
-            (22.0,  1.5, "vehicle.citroen.c3"),
-        ],
-        npc_autopilot = [
-            (55.0,  0.0, "vehicle.mini.cooperst"),
-        ],
-    ),
-    MiniScenario(
-        name          = "town03_roundabout_triple",
-        base_scenario = "roundabout",
-        route_length  = 120,
-        spawn_index   = 0,
-        obstacles     = [
-            (20.0,  1.5, "vehicle.audi.a2"),
-            (40.0, -1.5, "vehicle.volkswagen.t2"),
-            (60.0,  1.5, "vehicle.nissan.micra"),
-        ],
-    ),
 
-    # ── regular 12–15 : Town04 / highway & crossing ───────────────────────────
-    MiniScenario(
-        name          = "town04_highway_shoulder_trio",
-        base_scenario = "highway",
-        route_length  = 160,
-        spawn_index   = 9,
-        obstacles     = [
-            (30.0,  2.0, "vehicle.tesla.model3"),
-            (60.0,  2.0, "vehicle.audi.a2"),
-            (90.0,  2.0, "vehicle.nissan.micra"),
-        ],
-    ),
-    MiniScenario(
-        name          = "town04_highway_slow_traffic",
-        base_scenario = "highway",
-        route_length  = 160,
-        spawn_index   = 9,
-        npc_autopilot = [
-            (40.0,  0.0, "vehicle.mini.cooperst"),
-            (60.0,  0.0, "vehicle.citroen.c3"),
-        ],
-    ),
+    # ── regular 12–13 : Town04 / crossing ────────────────────────────────────
     MiniScenario(
         name          = "town04_crossing_triple",
         base_scenario = "crossing",
-        route_length  = 130,
+        route_length  = 160,
         spawn_index   = 166,
         obstacles     = [
             (20.0,  1.5, "vehicle.nissan.micra"),
@@ -758,7 +633,7 @@ MINI_SCENARIOS: List[MiniScenario] = [
     MiniScenario(
         name          = "town04_crossing_parked_plus_slow",
         base_scenario = "crossing",
-        route_length  = 130,
+        route_length  = 160,
         spawn_index   = 166,
         obstacles     = [
             (22.0,  1.5, "vehicle.citroen.c3"),
@@ -768,6 +643,16 @@ MINI_SCENARIOS: List[MiniScenario] = [
             (65.0,  0.0, "vehicle.mini.cooperst"),
         ],
     ),
+]
+
+# Snapshot of every scenario before NPC removal — preserved for reference /
+# future restore.  OLD_SCENARIOS[i] mirrors MINI_SCENARIOS[i] exactly.
+OLD_SCENARIOS: List[MiniScenario] = copy.deepcopy(MINI_SCENARIOS)
+
+# Strip all actors and route offsets from every active scenario.
+MINI_SCENARIOS = [
+    dc_replace(ms, obstacles=[], npc_autopilot=[], npc_crash=[], detour_peak_m=0)
+    for ms in MINI_SCENARIOS
 ]
 
 
@@ -961,7 +846,9 @@ def _spawn_scenario_obstacles(
     the obstacle position is identical whether called from the AV phase or the
     human phase, and is not affected by any physics drift of the hero vehicle.
     The hero is only used to get the correct ground-level z.
-    Returns the list of spawned actors so the caller can destroy them later.
+    Returns (spawned_actors, no_detour_ids) where no_detour_ids is a set of
+    actor IDs that should be excluded from the route-detour calculation.
+    Tuple element [6] == False opts an obstacle out of detour (default: included).
     """
     pts   = world.get_map().get_spawn_points()  # type: ignore[union-attr]
     tf    = pts[spawn_index % len(pts)]          # fixed reference — never drifts
@@ -970,34 +857,52 @@ def _spawn_scenario_obstacles(
     fwd_x, fwd_y =  math.cos(yaw_r),  math.sin(yaw_r)
     rgt_x, rgt_y =  math.sin(yaw_r), -math.cos(yaw_r)   # 90° clockwise = right
 
-    bp_lib  = world.get_blueprint_library()  # type: ignore[union-attr]
-    spawned: List[object] = []
+    bp_lib       = world.get_blueprint_library()  # type: ignore[union-attr]
+    spawned:       List[object] = []
+    no_detour_ids: set          = set()
 
-    for fwd_m, right_m, bp_id in scenario.obstacles:
+    for entry in scenario.obstacles:
+        fwd_m, right_m, bp_id = entry[0], entry[1], entry[2]
+        yaw_offset  = float(entry[3]) if len(entry) > 3 else 0.0
+        include_det = bool(entry[6]) if len(entry) > 6 else True
         try:
             bp = bp_lib.find(bp_id)
         except Exception:
+            print(f"  [spawn] WARNING: blueprint '{bp_id}' not found — skipping.")
             continue
 
-        # Use the hero's *actual* location z (post-physics settle) rather than the
-        # raw spawn-transform z (which is ~0.0 in Town01 and causes try_spawn_actor
-        # to reject the position as underground).  hero.get_location().z is the
-        # settled vehicle-centre height and is the correct value for any vehicle
-        # on the same flat road.
-        loc = carla.Location(
-            x = tf.location.x + fwd_m * fwd_x + right_m * rgt_x,
-            y = tf.location.y + fwd_m * fwd_y + right_m * rgt_y,
-            z = hero.get_location().z - 0.25,  # type: ignore[union-attr]
-        )
-        obs_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw))
+        if len(entry) >= 6 and entry[4] is not None and entry[5] is not None:
+            _ox, _oy = float(entry[4]), float(entry[5])
+        else:
+            _ox = tf.location.x + fwd_m * fwd_x + right_m * rgt_x
+            _oy = tf.location.y + fwd_m * fwd_y + right_m * rgt_y
+        if len(entry) >= 8 and entry[7] is not None:
+            _oz = float(entry[7])  # explicit z override
+        else:
+            # Project onto the road surface so z is always on the drivable lane
+            # regardless of map terrain.  Fallback to hero z if no waypoint found.
+            _wpt = world.get_map().get_waypoint(  # type: ignore[union-attr]
+                carla.Location(x=_ox, y=_oy, z=hero.get_location().z),  # type: ignore[union-attr]
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            _oz = (_wpt.transform.location.z if _wpt is not None
+                   else hero.get_location().z - 0.25)  # type: ignore[union-attr]
+        loc = carla.Location(x=_ox, y=_oy, z=_oz + 0.05)  # tiny lift prevents underground spawn; physics disabled so no settling
+        obs_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw + yaw_offset))
         actor  = world.try_spawn_actor(bp, obs_tf)  # type: ignore[union-attr]
         if actor is not None:
             actor.set_simulate_physics(False)   # freeze immediately — no drift or fall
             spawned.append(actor)
+            if not include_det:
+                no_detour_ids.add(actor.id)
+        else:
+            print(f"  [spawn] WARNING: try_spawn_actor failed at {loc} for '{bp_id}' "
+                  f"(wpt={'found' if _wpt else 'none'}, z={_oz:.2f})")
 
     if spawned:
         world.tick()  # register all actors before the game loop starts  # type: ignore[union-attr]
-    return spawned
+    return spawned, no_detour_ids
 
 
 def _spawn_npc_autopilot(
@@ -1036,13 +941,19 @@ def _spawn_npc_autopilot(
         try:
             bp = bp_lib.find(bp_id)
         except Exception:
+            print(f"  [spawn] WARNING: blueprint '{bp_id}' not found — skipping.")
             continue
 
-        loc = carla.Location(
-            x = tf.location.x + fwd_m * fwd_x + right_m * rgt_x,
-            y = tf.location.y + fwd_m * fwd_y + right_m * rgt_y,
-            z = hero.get_location().z - 0.25,  # type: ignore[union-attr]
+        _nx = tf.location.x + fwd_m * fwd_x + right_m * rgt_x
+        _ny = tf.location.y + fwd_m * fwd_y + right_m * rgt_y
+        _wpt = world.get_map().get_waypoint(  # type: ignore[union-attr]
+            carla.Location(x=_nx, y=_ny, z=hero.get_location().z),  # type: ignore[union-attr]
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
         )
+        _nz = (_wpt.transform.location.z if _wpt is not None
+               else hero.get_location().z - 0.25)  # type: ignore[union-attr]
+        loc    = carla.Location(x=_nx, y=_ny, z=_nz + 0.3)
         npc_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw))
         actor  = world.try_spawn_actor(bp, npc_tf)  # type: ignore[union-attr]
         if actor is not None:
@@ -1051,6 +962,9 @@ def _spawn_npc_autopilot(
                 tm.vehicle_percentage_speed_difference(actor, 70)  # 30% of speed limit ≈ slow
                 tm.auto_lane_change(actor, False)                  # stay in lane
             spawned.append(actor)
+        else:
+            print(f"  [spawn] WARNING: try_spawn_actor failed at {loc} for '{bp_id}' "
+                  f"(wpt={'found' if _wpt else 'none'}, z={_nz:.2f})")
 
     if spawned:
         world.tick()  # type: ignore[union-attr]
@@ -1087,17 +1001,27 @@ def _spawn_npc_crash(
     bp_lib  = world.get_blueprint_library()  # type: ignore[union-attr]
     spawned: List[object] = []
 
-    for fwd_m, right_m, bp_id, steer in scenario.npc_crash:
+    for entry in scenario.npc_crash:
+        fwd_m, right_m, bp_id, steer = entry[0], entry[1], entry[2], entry[3]
         try:
             bp = bp_lib.find(bp_id)
         except Exception:
+            print(f"  [spawn] WARNING: blueprint '{bp_id}' not found — skipping.")
             continue
 
-        loc = carla.Location(
-            x = tf.location.x + fwd_m * fwd_x + right_m * rgt_x,
-            y = tf.location.y + fwd_m * fwd_y + right_m * rgt_y,
-            z = hero.get_location().z - 0.25,  # type: ignore[union-attr]
+        if len(entry) >= 6 and entry[4] is not None and entry[5] is not None:
+            _cx, _cy = float(entry[4]), float(entry[5])
+        else:
+            _cx = tf.location.x + fwd_m * fwd_x + right_m * rgt_x
+            _cy = tf.location.y + fwd_m * fwd_y + right_m * rgt_y
+        _wpt = world.get_map().get_waypoint(  # type: ignore[union-attr]
+            carla.Location(x=_cx, y=_cy, z=hero.get_location().z),  # type: ignore[union-attr]
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
         )
+        _cz = (_wpt.transform.location.z if _wpt is not None
+               else hero.get_location().z - 0.25)  # type: ignore[union-attr]
+        loc    = carla.Location(x=_cx, y=_cy, z=_cz + 0.3)
         npc_tf = carla.Transform(loc, carla.Rotation(yaw=tf.rotation.yaw))
         actor  = world.try_spawn_actor(bp, npc_tf)  # type: ignore[union-attr]
         if actor is not None:
@@ -1112,6 +1036,9 @@ def _spawn_npc_crash(
                 reverse=False,
             ))
             spawned.append(actor)
+        else:
+            print(f"  [spawn] WARNING: try_spawn_actor failed at {loc} for '{bp_id}' "
+                  f"(wpt={'found' if _wpt else 'none'}, z={_cz:.2f})")
 
     if spawned:
         world.tick()  # type: ignore[union-attr]
@@ -1125,10 +1052,23 @@ def _carla_rgb(rgb: Tuple[int, int, int]) -> object:
 
 
 def _dist_color(dist_m: float, colorblind: bool = False) -> Tuple[int, int, int]:
-    t = float(np.clip(dist_m / _MAX_DIST_M, 0.0, 1.0))
+    t = float(np.clip(dist_m / _COLOR_DIST_M, 0.0, 1.0))
     if colorblind:
         return (int(t * 230), int(114 - t * 114), int(178 - t * 178))
     return (int(t * 220), int((1 - t) * 200), 0)
+
+
+def _speed_color(human_speed: float, av_speed: float, colorblind: bool = False) -> Tuple[int, int, int]:
+    """Color by human speed relative to AV speed.
+
+    t=0 (green)    → human ≥10 m/s slower than AV
+    t=0.5 (yellow) → same speed as AV
+    t=1 (red)      → human ≥10 m/s faster than AV
+    """
+    t = float(np.clip((human_speed - av_speed) / 10.0 + 0.5, 0.0, 1.0))
+    if colorblind:
+        return (int(t * 230), int(114 - t * 114), int(178 - t * 178))
+    return (int(t * 220), int((1.0 - t) * 200), 0)
 
 
 # Module-level sound cooldown (reset at episode start)
@@ -1157,44 +1097,30 @@ def _draw_av_dot(world: object, traj: AVTrajectory, sim_time: float) -> None:
             )
 
 
-def _show_score_between(
-    world:           object,
-    scenario_name:   str,
-    iteration:       int,
-    av_score:        float,
-    alignment_score: float,
-    duration:        float = 4.0,
-) -> None:
-    """Display a score summary centered in the spectator view for `duration` seconds."""
-    clock  = pygame.time.Clock()
-    start  = time.time()
-    lines  = [
-        f"== SCENARIO {iteration} COMPLETE ==",
-        f"Scenario  : {scenario_name}",
-        f"AV Score  : {av_score:.2f}",
-        f"Alignment : {alignment_score:.2f}",
-    ]
-    while time.time() - start < duration:
-        remaining = max(0.0, duration - (time.time() - start))
-        display   = lines + [f"Next in {remaining:.0f}s ..."]
 
-        # Re-sample spectator each tick so text stays fixed to the view
-        sp_tf = world.get_spectator().get_transform()  # type: ignore[union-attr]
-        fwd   = sp_tf.get_forward_vector()
-        # Place anchor 6 m ahead of spectator in the direction it is looking
-        ax = sp_tf.location.x + 6.0 * fwd.x
-        ay = sp_tf.location.y + 6.0 * fwd.y
-        az = sp_tf.location.z + 6.0 * fwd.z
+def _draw_route(world, alert, hero, traj, sim_time):
+    """Draw the AV trajectory as debug lines coloured by human speed vs AV speed."""
+    positions = traj.all_positions()
+    if len(positions) < 2:
+        return
 
-        for i, line in enumerate(display):
-            world.debug.draw_string(  # type: ignore[union-attr]
-                location=carla.Location(x=ax, y=ay, z=az - i * 0.7),
-                text=line,
-                color=carla.Color(r=255, g=255, b=80),
-                life_time=_DRAW_LT * 2,
-            )
-        world.tick()  # type: ignore[union-attr]
-        clock.tick(FPS)
+    vel    = hero.get_velocity()
+    hspeed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+    color  = _speed_color(hspeed, traj.get_speed_at(sim_time), bool(alert.color))
+    c      = carla.Color(r=color[0], g=color[1], b=color[2])
+
+    # Sample at most ~60 segments so debug draw calls stay cheap
+    n    = len(positions)
+    step = max(1, n // 60)
+    for i in range(0, n - step, step):
+        a, b = positions[i], positions[i + step]
+        world.debug.draw_line(
+            carla.Location(x=a[0], y=a[1], z=a[2] + 0.3),
+            carla.Location(x=b[0], y=b[1], z=b[2] + 0.3),
+            thickness=0.05,
+            color=c,
+            life_time=_DRAW_LT,
+        )
 
 
 def draw_alert(
@@ -1212,7 +1138,7 @@ def draw_alert(
     if alert.gui_type == 0:
         _draw_arrow(world, alert, hero, traj, sim_time)
     elif alert.gui_type == 1:
-        _draw_route(world, alert, hero, traj)
+        _draw_route(world, alert, hero, traj, sim_time)
     elif alert.gui_type == 2:
         _tick_sound(alert, hero, traj, sim_time)
 
@@ -1231,11 +1157,17 @@ def _draw_arrow(world, alert, hero, traj, sim_time):
     htf  = hero.get_transform()
     yaw  = math.radians(htf.rotation.yaw)
 
-    # Distance to AV for color
+    # Distance to AV target (still used for vibration threshold)
     dist = math.sqrt((target[0] - hloc.x)**2 + (target[1] - hloc.y)**2)
-    color = _dist_color(dist, bool(alert.color))
 
-    # Windshield anchor: 1.3 m ahead of driver, at eye height
+    # Speed-based color: faster than AV → red, slower → green
+    _hvel      = hero.get_velocity()
+    _hspeed    = math.sqrt(_hvel.x ** 2 + _hvel.y ** 2 + _hvel.z ** 2)
+    _av_speed  = traj.get_speed_at(sim_time)
+    color      = _speed_color(_hspeed, _av_speed, bool(alert.color))
+
+    # Windshield anchor: 1.3 m ahead, centred in the driver's view
+    # (no lateral offset — matches the centre of the score GUI on screen).
     ws_x      = hloc.x + 1.3 * math.cos(yaw)
     ws_y      = hloc.y + 1.3 * math.sin(yaw)
     ws_z      = hloc.z + 1.25   # windshield centre height
@@ -1283,50 +1215,11 @@ def _draw_arrow(world, alert, hero, traj, sim_time):
         )
 
 
-def _draw_route(world, alert, hero, traj):
-    positions = traj.all_positions()
-    if len(positions) < 2:
-        return
-
-    line_w   = max(0.09, float(alert.gui_params[0]) * 0.2)  # min 3× original 0.03
-    opacity  = float(alert.gui_params[1])
-    vib_dist = float(alert.gui_params[2]) * _MAX_DIST_M
-
-    hloc    = hero.get_location()
-    nearest = min(math.sqrt((p[0]-hloc.x)**2 + (p[1]-hloc.y)**2) for p in positions)
-    color   = _dist_color(nearest, bool(alert.color))
-
-    if bool(alert.vibration) and nearest > vib_dist:
-        world.debug.draw_string(
-            location=carla.Location(x=hloc.x, y=hloc.y, z=hloc.z + 3.0),
-            text="! OFF ROUTE !",
-            color=_carla_rgb((255, 80, 0)),
-            life_time=_DRAW_LT,
-        )
-
-    # Draw segments within a rolling proximity window so the route advances
-    # with the driver instead of being front-loaded at position 0 (where CARLA's
-    # render distance would hide everything further than ~50 m away).
-    DRAW_RADIUS = 150.0  # metres ahead/behind hero to render
-    step = max(1, len(positions) // 400)
-    for i in range(0, len(positions) - step, step):
-        a = positions[i]
-        if (a[0] - hloc.x) ** 2 + (a[1] - hloc.y) ** 2 > DRAW_RADIUS ** 2:
-            continue
-        b = positions[i + step]
-        world.debug.draw_line(
-            begin=carla.Location(x=a[0], y=a[1], z=a[2] + 0.3),
-            end=carla.Location(  x=b[0], y=b[1], z=b[2] + 0.3),
-            thickness=line_w * opacity,
-            color=_carla_rgb(color),
-            life_time=_DRAW_LT,
-        )
-
 
 def _tick_sound(alert, hero, traj, sim_time):
     global _last_sound_t
-    lat_thresh = float(alert.gui_params[0]) * 10.0    # [0,1] → [0,10] m
-    cooldown   = float(alert.gui_params[1]) * 150.0  # [0,1] → [0,150] s (15× reduction)
+    lat_thresh = float(alert.gui_params[0]) * 4.0     # [0,1] → [0,4] m  (was 10 — reduced for earlier trigger)
+    cooldown   = float(alert.gui_params[1]) * 10.0   # [0,1] → [0,10] s
     volume     = float(alert.gui_params[2])
 
     if sim_time - _last_sound_t < cooldown:
@@ -1339,6 +1232,138 @@ def _tick_sound(alert, hero, traj, sim_time):
     _play_direction(direction, volume)
     _last_sound_t = sim_time
     print(f"[sound] Played '{direction}' (lateral offset={offset:.2f}m)")
+
+
+# ── SCORE GUI ─────────────────────────────────────────────────────────────────
+
+def _show_score_pygame(
+    scenario_name:  str,
+    iteration:      int,
+    driving_score:  float,
+    episode_loss:   float,
+    duration:       float = 10.0,
+) -> None:
+    """Large pygame score screen shown after each scenario (human run + training).
+
+    Shows the human driving score and the alert loss for the iteration just
+    completed.  Press SPACE / ENTER to skip early.
+
+    driving_score : mean of the 4 style-reward components (speed, efficiency,
+                    aggressiveness, comfort) for the human across all ticks — higher = better
+    episode_loss  : mean euclidean distance (m) between human and AV positions — lower = better
+    """
+    import pygame as pg
+
+    def _score_col(v: float, invert: bool = False) -> tuple:
+        """Green = good.  invert=True for loss (lower is better)."""
+        if invert:
+            if v <= 0.05: return (60, 230, 60)
+            if v <= 0.20: return (230, 210, 50)
+            return (220, 70, 70)
+        else:
+            if v >= 0.7: return (60, 230, 60)
+            if v >= 0.4: return (230, 210, 50)
+            return (220, 70, 70)
+
+    if not pg.get_init():
+        pg.init()
+    if not pg.font.get_init():
+        pg.font.init()
+
+    W, H = 1280, 860
+    _info = pg.display.Info()
+    _cx = max(0, (_info.current_w - W) // 2)
+    _cy = max(0, (_info.current_h - H) // 2)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{_cx},{_cy}"
+    screen = pg.display.set_mode((W, H), pg.NOFRAME)
+    pg.display.set_caption("Score")
+
+    font_title   = pg.font.SysFont("Arial", 56, bold=True)
+    font_name    = pg.font.SysFont("Arial", 38)
+    font_huge    = pg.font.SysFont("Arial", 150, bold=True)
+    font_medium  = pg.font.SysFont("Arial", 90, bold=True)
+    font_label   = pg.font.SysFont("Arial", 36)
+    font_explain = pg.font.SysFont("Arial", 28)
+    font_footer  = pg.font.SysFont("Arial", 30)
+
+    BG     = (12, 14, 26)
+    PANEL  = (22, 26, 48)
+    BORDER = (60, 80, 140)
+    DIM    = (100, 110, 140)
+    WHITE  = (210, 215, 255)
+
+    clock = pg.time.Clock()
+    start = time.time()
+
+    while True:
+        remaining = max(0.0, duration - (time.time() - start))
+        for ev in pg.event.get():
+            if ev.type == pg.QUIT:
+                pg.display.quit()
+                return
+            if ev.type == pg.KEYDOWN and ev.key in (pg.K_RETURN, pg.K_SPACE, pg.K_ESCAPE):
+                pg.display.quit()
+                return
+
+        if remaining <= 0.0:
+            break
+
+        screen.fill(BG)
+        pad = 40
+        pg.draw.rect(screen, PANEL,  (pad, pad, W - 2*pad, H - 2*pad), border_radius=18)
+        pg.draw.rect(screen, BORDER, (pad, pad, W - 2*pad, H - 2*pad), 3, border_radius=18)
+
+        cy = pad + 36
+
+        # ── header ────────────────────────────────────────────────────────────
+        t = font_title.render(f"SCENARIO {iteration} COMPLETE", True, WHITE)
+        screen.blit(t, t.get_rect(centerx=W//2, y=cy)); cy += 62
+
+        n = font_name.render(scenario_name.upper().replace("_", " "), True, DIM)
+        screen.blit(n, n.get_rect(centerx=W//2, y=cy)); cy += 44
+
+        pg.draw.line(screen, BORDER, (pad + 60, cy), (W - pad - 60, cy), 2); cy += 18
+
+        # ── AV Driving Score ──────────────────────────────────────────────────
+        ds_col = _score_col(driving_score, invert=False)
+        ds_surf = font_huge.render(f"{driving_score:.3f}", True, ds_col)
+        screen.blit(ds_surf, ds_surf.get_rect(centerx=W//2, y=cy)); cy += 158
+
+        lbl1 = font_label.render("HUMAN  DRIVING  SCORE", True, DIM)
+        screen.blit(lbl1, lbl1.get_rect(centerx=W//2, y=cy)); cy += 42
+
+        exp1 = font_explain.render(
+            "RL reward accumulated by the AV during the pre-run.  Higher = better route completion.",
+            True, (140, 150, 180))
+        screen.blit(exp1, exp1.get_rect(centerx=W//2, y=cy)); cy += 36
+
+        pg.draw.line(screen, BORDER, (pad + 60, cy), (W - pad - 60, cy), 2); cy += 18
+
+        # ── Alert Model Loss ──────────────────────────────────────────────────
+        el_col = _score_col(episode_loss, invert=True)
+        el_surf = font_medium.render(f"{episode_loss:.4f}", True, el_col)
+        screen.blit(el_surf, el_surf.get_rect(centerx=W//2, y=cy)); cy += 100
+
+        lbl2 = font_label.render("ALERT  MODEL  LOSS", True, DIM)
+        screen.blit(lbl2, lbl2.get_rect(centerx=W//2, y=cy)); cy += 42
+
+        exp2 = font_explain.render(
+            "Training loss after learning from your driving.  Lower = alert model is improving.",
+            True, (140, 150, 180))
+        screen.blit(exp2, exp2.get_rect(centerx=W//2, y=cy)); cy += 36
+
+        pg.draw.line(screen, BORDER, (pad + 60, cy), (W - pad - 60, cy), 2); cy += 14
+
+        # ── footer ────────────────────────────────────────────────────────────
+        f = font_footer.render(
+            f"Next in {remaining:.0f}s  —  press SPACE or ENTER to continue",
+            True, (80, 90, 120))
+        screen.blit(f, f.get_rect(centerx=W//2, y=cy))
+
+        pg.display.flip()
+        clock.tick(30)
+
+    pg.display.quit()
 
 
 # ── STATE BUILDER ─────────────────────────────────────────────────────────────
@@ -1394,148 +1419,216 @@ def _nearest_av(steps: List[AVStepData], t: float) -> AVStepData:
     return steps[lo]
 
 
+def _nearest_av_by_position(steps: List[AVStepData], x: float, y: float) -> AVStepData:
+    """Return the AV step whose XY position is closest to (x, y)."""
+    if not steps:
+        return AVStepData(0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+    best = steps[0]
+    best_d2 = float('inf')
+    for s in steps:
+        d2 = (s.x - x) ** 2 + (s.y - y) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best = s
+    return best
+
+
+def _compute_human_driving_score(
+    avg_dist_to_center: float,
+    collision_cnt_env:  int,
+    collision_cnt_car:  int,
+    lane_invasion_cnt:  int,
+    speeding_cnt:       int,
+    timeout:            float,
+    route_completion:   float,
+) -> float:
+    """Identical formula to carla_gym_env.py adjusted_driving_core.
+
+    Factors (all ≤ 1, multiplicative penalties):
+      0.98 ^ avg_dist_to_center  — lane-centre deviation (per-tick average metres)
+      0.65 ^ collision_cnt_env   — collisions with static environment
+      0.75 ^ collision_cnt_car   — collisions with other vehicles
+      0.995^ lane_invasion_cnt   — lane-marking crossings
+      0.95 ^ speeding_cnt        — ticks spent above speed limit
+      0.75 ^ timeout             — episode ended by timeout (0 or 1)
+      route_completion ^ 1.2     — fraction of AV waypoints reached
+    """
+    score = (
+        0.98 ** avg_dist_to_center *
+        0.65 ** collision_cnt_env  *
+        0.75 ** collision_cnt_car  *
+        0.995 ** lane_invasion_cnt *
+        0.95 ** speeding_cnt       *
+        0.75 ** timeout            *
+        route_completion ** 1.2
+    )
+    return round(float(np.clip(score, 0.0, 1.0)), 3)
+
+
 # ── TUTORIAL ──────────────────────────────────────────────────────────────────
 
-# Each stage: (start_second, headline, detail_lines)
-_TUTORIAL_STAGES = [
-    (0,  "WELCOME — LEARN THE CONTROLS",
-         ["You are about to drive a real simulation.",
-          "Each control below maps to your physical hardware.",
-          "Practice freely — the car won't be judged yet.",
-          "The tutorial lasts about 90 seconds."]),
-    (18, "RIGHT PEDAL  =  THROTTLE / GAS",
-         ["Press the RIGHT pedal to accelerate.",
-          "Release it fully to coast.",
-          "Try pressing it now and drive forward!"]),
-    (36, "MIDDLE PEDAL  =  BRAKE",
-         ["Press the MIDDLE pedal to slow down or stop.",
-          "Hold it to come to a complete stop.",
-          "Try braking from speed — feel the response."]),
-    (54, "STEERING WHEEL  =  STEER",
-         ["Turn the wheel left or right to steer the car.",
-          "Small inputs = gentle lane changes.",
-          "Try a smooth left turn, then a right turn."]),
-    (72, "RSB BUTTON  =  REVERSE MODE",
-         ["Press RSB (right shoulder button) to enter REVERSE.",
-          "Press RSB again to return to FORWARD.",
-          "In reverse: gas pedal drives you backward.",
-          "Try reversing, then come back to forward."]),
-]
+# Tutorial is now fully action-gated (see run_tutorial).
+# _TUTORIAL_DURATION is kept so --tutorial-duration CLI arg still parses.
 _TUTORIAL_DURATION = 90  # seconds
 
 
-def run_tutorial(_client: object, world: object) -> None:
+def run_tutorial(_client: object, world: object, duration: int = _TUTORIAL_DURATION) -> None:
     """Interactive control tutorial shown before calibration.
 
-    The hero car is spawned and fully driveable throughout.
-    Stage text is displayed in the UE4 window anchored to the spectator,
-    cycling through each control every ~18 seconds.
+    Each stage waits for the participant to actually perform the action before
+    advancing — the tutorial does not time out mid-stage.  Reverse detection
+    monitors the ControlReader.reverse flag toggling ON.
+
+    Stages (in order):
+      0  Welcome          — auto-advances after 6 s
+      1  Gas / Throttle   — advance when throttle > 0.25
+      2  Brake            — advance when brake    > 0.25
+      3  Steer            — advance when |steer|  > 0.25
+      4  Reverse (RSB)    — advance when reverse flag turns True
+      done → return
     """
     print(f"\n{'='*60}")
-    print(f"TUTORIAL  ({_TUTORIAL_DURATION}s)  — teaching controls")
+    print(f"TUTORIAL  (max {duration}s)  — interactive control check")
     print(f"{'='*60}")
 
-    # Clear any leftover actors
-    _tut_clear = [
-        a for a in world.get_actors()  # type: ignore[union-attr]
-        if a.type_id.startswith("vehicle.") or a.type_id.startswith("walker.")
+    # Stage definitions: (headline, detail_lines, completion_hint)
+    _STAGES = [
+        ("WELCOME — LEARN THE CONTROLS",
+         ["You are about to drive a simulation.",
+          "Follow each prompt and perform the action shown.",
+          "The next stage unlocks once you complete the action.",
+          "Take your time — the tutorial waits for you."],
+         None),   # auto-advance
+        ("RIGHT PEDAL  =  GAS / THROTTLE",
+         ["Press the RIGHT pedal to accelerate forward.",
+          "Release fully to coast.",
+          ">>> Press the gas pedal now to continue <<<"],
+         "throttle"),
+        ("MIDDLE PEDAL  =  BRAKE",
+         ["Press the MIDDLE pedal to slow down or stop.",
+          "Hold it to come to a complete stop.",
+          ">>> Press the brake pedal now to continue <<<"],
+         "brake"),
+        ("STEERING WHEEL  =  STEER",
+         ["Turn the wheel left or right to steer.",
+          "Small inputs = gentle changes.",
+          ">>> Turn the wheel now to continue <<<"],
+         "steer"),
+        ("RSB BUTTON  =  REVERSE MODE",
+         ["Press RSB (right shoulder button) to enter REVERSE.",
+          "Press RSB again to return to FORWARD.",
+          "In reverse: gas pedal drives you backward.",
+          ">>> Press RSB now to continue <<<"],
+         "reverse"),
     ]
-    for _a in _tut_clear:
+
+    # Clear any leftover actors
+    for _a in [a for a in world.get_actors()  # type: ignore[union-attr]
+               if a.type_id.startswith("vehicle.") or a.type_id.startswith("walker.")]:
         _a.destroy()
-    if _tut_clear:
-        world.tick()  # type: ignore[union-attr]
+    world.tick()  # type: ignore[union-attr]
 
     hero        = _spawn_hero(world)
     ctrl_reader = ControlReader()
     clock       = pygame.time.Clock()
-    start_t     = time.time()
 
-    # All control lines shown as a persistent reminder (dim white)
-    _all_controls = [
-        "RIGHT pedal  =  Throttle / Gas",
-        "MIDDLE pedal =  Brake",
-        "Steering Wheel  =  Steer",
-        "RSB button  =  Reverse / Forward",
-    ]
+    stage_idx        = 0
+    stage_start      = time.time()
+    stage_done       = False        # flashes "✓ Done!" briefly before advancing
+    stage_done_t     = 0.0
+    _DONE_FLASH_S    = 1.2          # seconds to show the tick before advancing
+    _WELCOME_AUTO_S  = 6.0          # auto-advance welcome stage after this many seconds
+    _prev_reverse    = False        # track reverse toggle
 
     try:
-        while True:
-            elapsed   = time.time() - start_t
-            remaining = int(_TUTORIAL_DURATION - elapsed)
-            if remaining <= 0 or ctrl_reader.quit_request:
-                break
-
+        while stage_idx < len(_STAGES):
             ctrl = ctrl_reader.read()
-            hero.apply_control(ctrl)
-            world.tick()  # type: ignore[union-attr]
+            if ctrl_reader.quit_request:
+                break
+            hero.apply_control(ctrl)  # type: ignore[union-attr]
+            world.tick()              # type: ignore[union-attr]
             clock.tick(FPS)
             _spectator_follow(world, hero)
 
-            # Determine which stage is active
-            stage_idx = 0
-            for _si, _stage in enumerate(_TUTORIAL_STAGES):
-                if elapsed >= _stage[0]:
-                    stage_idx = _si
+            now        = time.time()
+            stage_age  = now - stage_start
+            headline, detail_lines, action = _STAGES[stage_idx]
 
-            headline, detail_lines = _TUTORIAL_STAGES[stage_idx][1], _TUTORIAL_STAGES[stage_idx][2]
+            # ── Check completion ──────────────────────────────────────────────
+            if not stage_done:
+                completed = False
+                if action is None:
+                    completed = stage_age >= _WELCOME_AUTO_S
+                elif action == "throttle":
+                    completed = float(ctrl.throttle) > 0.25
+                elif action == "brake":
+                    completed = float(ctrl.brake) > 0.25
+                elif action == "steer":
+                    completed = abs(float(ctrl.steer)) > 0.25
+                elif action == "reverse":
+                    # detect the moment reverse turns ON
+                    _cur_rev = bool(ctrl_reader.reverse)
+                    completed = _cur_rev and not _prev_reverse
+                    _prev_reverse = _cur_rev
 
-            # ── Anchor text in front of spectator (center-screen) ──────────
-            sp_tf = world.get_spectator().get_transform()  # type: ignore[union-attr]
-            fwd   = sp_tf.get_forward_vector()
-            ax = sp_tf.location.x + 6.0 * fwd.x
-            ay = sp_tf.location.y + 6.0 * fwd.y
-            az = sp_tf.location.z + 6.0 * fwd.z
+                if completed:
+                    stage_done   = True
+                    stage_done_t = now
+            elif now - stage_done_t >= _DONE_FLASH_S:
+                stage_idx   += 1
+                stage_start  = now
+                stage_done   = False
+                _prev_reverse = bool(ctrl_reader.reverse)
+                continue
 
-            # Countdown + reverse indicator (top line)
-            rev_tag = "  [ REVERSE ]" if ctrl_reader.reverse else ""
+            # ── Anchor text near windshield (same as arrow) ───────────────────
+            _hloc  = hero.get_location()   # type: ignore[union-attr]
+            _hvel  = hero.get_velocity()   # type: ignore[union-attr]
+            _htf   = hero.get_transform()  # type: ignore[union-attr]
+            _hyaw  = math.radians(_htf.rotation.yaw)
+            # 0.20 m forward (closer = larger on screen); 3.5 m left of centre
+            _lft_x = -math.sin(_hyaw)
+            _lft_y =  math.cos(_hyaw)
+            _px    = _hloc.x + _hvel.x * _DT + 0.20 * math.cos(_hyaw) + 3.5 * _lft_x
+            _py    = _hloc.y + _hvel.y * _DT + 0.20 * math.sin(_hyaw) + 3.5 * _lft_y
+            _wz    = _hloc.z + _hvel.z * _DT + 1.25
+
+            step_lbl = f"Step {stage_idx}/{len(_STAGES)-1}"
+            rev_tag  = "  [ REVERSE ]" if ctrl_reader.reverse else ""
             world.debug.draw_string(  # type: ignore[union-attr]
-                location=carla.Location(x=ax, y=ay, z=az + 2.5),
-                text=f"TUTORIAL  {remaining}s remaining{rev_tag}",
+                location=carla.Location(x=_px, y=_py, z=_wz + 0.28),
+                text=f"TUTORIAL  {step_lbl}{rev_tag}",
                 color=carla.Color(r=180, g=180, b=180),
-                life_time=_DRAW_LT * 2,
+                life_time=_DRAW_LT,
             )
 
-            # Active stage headline (bright yellow, large)
-            world.debug.draw_string(  # type: ignore[union-attr]
-                location=carla.Location(x=ax, y=ay, z=az + 1.6),
-                text=f">>> {headline} <<<",
-                color=carla.Color(r=255, g=240, b=0),
-                life_time=_DRAW_LT * 2,
-            )
-
-            # Detail lines for the active stage (white)
-            for _li, _dl_line in enumerate(detail_lines):
+            if stage_done:
                 world.debug.draw_string(  # type: ignore[union-attr]
-                    location=carla.Location(x=ax, y=ay, z=az + 0.8 - _li * 0.65),
-                    text=_dl_line,
-                    color=carla.Color(r=230, g=230, b=230),
-                    life_time=_DRAW_LT * 2,
+                    location=carla.Location(x=_px, y=_py, z=_wz + 0.10),
+                    text=">>> DONE!  Moving to next step... <<<",
+                    color=carla.Color(r=60, g=255, b=60),
+                    life_time=_DRAW_LT,
                 )
-
-            # All-controls reminder at the bottom (dim grey)
-            base_z = az + 0.8 - len(detail_lines) * 0.65 - 0.5
-            world.debug.draw_string(  # type: ignore[union-attr]
-                location=carla.Location(x=ax, y=ay, z=base_z),
-                text="── All controls ──",
-                color=carla.Color(r=120, g=120, b=120),
-                life_time=_DRAW_LT * 2,
-            )
-            for _ci, _ctrl_line in enumerate(_all_controls):
-                # Highlight the active control in the summary too
-                _active = (stage_idx > 0 and _ci == stage_idx - 1)
+            else:
                 world.debug.draw_string(  # type: ignore[union-attr]
-                    location=carla.Location(x=ax, y=ay, z=base_z - 0.55 - _ci * 0.55),
-                    text=("* " if _active else "  ") + _ctrl_line,
-                    color=(carla.Color(r=255, g=220, b=80)
-                           if _active else carla.Color(r=110, g=110, b=110)),
-                    life_time=_DRAW_LT * 2,
+                    location=carla.Location(x=_px, y=_py, z=_wz + 0.10),
+                    text=f">>> {headline} <<<",
+                    color=carla.Color(r=255, g=240, b=0),
+                    life_time=_DRAW_LT,
                 )
+                for _li, _dl in enumerate(detail_lines):
+                    world.debug.draw_string(  # type: ignore[union-attr]
+                        location=carla.Location(x=_px, y=_py, z=_wz - 0.10 - _li * 0.17),
+                        text=_dl,
+                        color=carla.Color(r=230, g=230, b=230),
+                        life_time=_DRAW_LT,
+                    )
 
     finally:
         ctrl_reader.close()
-        hero.destroy()
+        hero.destroy()  # type: ignore[union-attr]
 
-    print(f"[tutorial] Done ({_TUTORIAL_DURATION}s).")
+    print(f"[tutorial] Done — all {len(_STAGES)} stages completed.")
 
 
 # ── PHASE 0: CALIBRATION ──────────────────────────────────────────────────────
@@ -1588,15 +1681,19 @@ def run_calibration(
             profile = regressor.tick(hero, world, _DT)
             _spectator_follow(world, hero)
 
-            # Draw HUD on the windshield (same plane as the arrow)
-            loc = hero.get_location()
-            htf = hero.get_transform()
+            # Draw HUD using predicted position to match spectator camera
+            loc  = hero.get_location()
+            vel  = hero.get_velocity()
+            htf  = hero.get_transform()
             _yaw = math.radians(htf.rotation.yaw)
-            ws_x = loc.x + 1.3 * math.cos(_yaw)
-            ws_y = loc.y + 1.3 * math.sin(_yaw)
+            _px  = loc.x + vel.x * _DT
+            _py  = loc.y + vel.y * _DT
+            _pz  = loc.z + vel.z * _DT
+            ws_x = _px + 0.8 * math.cos(_yaw)
+            ws_y = _py + 0.8 * math.sin(_yaw)
             rev_tag = "  [REVERSE]" if ctrl_reader.reverse else ""
             world.debug.draw_string(
-                location=carla.Location(x=ws_x, y=ws_y, z=loc.z + 1.45),
+                location=carla.Location(x=ws_x, y=ws_y, z=_pz + 1.3),
                 text=(f"CAL {remaining}s{rev_tag} | "
                       + "  ".join(f"{l[0]}:{v:.2f}"
                                   for l, v in zip(STYLE_LABELS, profile))),
@@ -1620,6 +1717,333 @@ def run_calibration(
     return profile
 
 
+# ── ROUTE OBSTACLE DETOUR ─────────────────────────────────────────────────────
+
+def _route_around_obstacles(
+    route:      list,
+    obs_actors: list,    # spawned obstacle actors (carla.Actor); positions read at call-time
+    peak_m:     float = _DETOUR_PEAK_M,
+) -> list:
+    """Shift waypoints around every spawned obstacle.
+
+    Hard zone  (d ≤ _WP_CLEAR_RADIUS)
+        Road-snap the shifted position to the nearest drivable lane.  When
+        ``peak_m`` is large enough to cross a lane boundary (≥ half a lane
+        width, roughly 1.75 m) this returns a real ``carla.Waypoint`` in the
+        adjacent lane — exactly what the AV model was trained to follow.
+
+    Transition zone  (_WP_CLEAR_RADIUS < d ≤ transition radius)
+        Uses ``_OffsetWP`` (a thin ``carla.Waypoint``-compatible wrapper) so
+        the ramp position is not snapped back to the original lane centre.
+
+    Connecting nodes
+        Three linearly-interpolated ``_OffsetWP`` nodes are inserted between
+        each adjacent (unshifted, shifted) pair to smooth the entry/exit arc.
+
+    Direction convention
+        ``rgt_x, rgt_y = fwd_y, -fwd_x`` (CARLA yaw convention).
+        Positive ``peak_m`` → obstacle on right → detour left (−rgt direction).
+        Negative ``peak_m`` flips to detour right.
+    """
+    if not obs_actors:
+        return route
+
+    _transition_r = _WP_CLEAR_RADIUS * _WP_TRANSITION_MULT
+
+    # Read actual actor world-positions at call-time.
+    obs_locs: List[Tuple[float, float]] = []
+    for _a in obs_actors:
+        try:
+            _al = _a.get_location()
+            obs_locs.append((_al.x, _al.y))
+        except Exception:
+            pass
+    if not obs_locs:
+        return route
+
+    # _OffsetWP: drop-in for carla.Waypoint that holds a raw shifted position.
+    # Used for transition-zone waypoints that sit between two lane centres.
+    class _OffsetWP:
+        __slots__ = ("transform", "is_junction")
+        def __init__(self, orig, nx: float, ny: float, nz: float) -> None:
+            self.transform  = carla.Transform(  # type: ignore[union-attr]
+                carla.Location(x=nx, y=ny, z=nz),  # type: ignore[union-attr]
+                orig.transform.rotation,
+            )
+            self.is_junction = bool(getattr(orig, "is_junction", False))
+
+    def _wp_xyz(wp) -> Tuple[float, float, float]:
+        try:
+            return (float(wp.transform.location.x),
+                    float(wp.transform.location.y),
+                    float(wp.transform.location.z))
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+    route_pts = [_wp_xyz(wp) for wp in route]
+    n = len(route)
+
+    # ── Pass 1: compute offset scalar and hard-zone flag per waypoint ─────────
+    offsets:      List[float] = []
+    rgt_vecs:     List[Tuple[float, float]] = []
+    in_hard_zone: List[bool]  = []
+
+    for i in range(n):
+        wx, wy, _ = route_pts[i]
+        j_lo = max(0, i - 2)
+        j_hi = min(n - 1, i + 2)
+        dx = route_pts[j_hi][0] - route_pts[j_lo][0]
+        dy = route_pts[j_hi][1] - route_pts[j_lo][1]
+        mag = math.sqrt(dx * dx + dy * dy)
+        if mag < 1e-6:
+            offsets.append(0.0)
+            rgt_vecs.append((0.0, 0.0))
+            in_hard_zone.append(False)
+            continue
+        fwd_x = dx / mag
+        fwd_y = dy / mag
+        rgt_x =  fwd_y
+        rgt_y = -fwd_x
+
+        total_lat = 0.0
+        hard = False
+        for ox, oy in obs_locs:
+            d = math.sqrt((wx - ox) ** 2 + (wy - oy) ** 2)
+            if d >= _transition_r:
+                continue
+            rgt_proj  = (ox - wx) * rgt_x + (oy - wy) * rgt_y
+            direction = -1.0 if rgt_proj >= 0.0 else 1.0
+            if d <= _WP_CLEAR_RADIUS:
+                hard = True
+                contribution = direction * peak_m
+            else:
+                t = (d - _WP_CLEAR_RADIUS) / (_transition_r - _WP_CLEAR_RADIUS)
+                contribution = direction * peak_m * 0.5 * (1.0 + math.cos(t * math.pi))
+            total_lat += contribution
+
+        # Minimum clearance enforcement (hard zone only)
+        for ox, oy in obs_locs:
+            d = math.sqrt((wx - ox) ** 2 + (wy - oy) ** 2)
+            if d >= _WP_CLEAR_RADIUS:
+                continue
+            sx = wx + total_lat * rgt_x
+            sy = wy + total_lat * rgt_y
+            lat_dist = (sx - ox) * rgt_x + (sy - oy) * rgt_y
+            if abs(lat_dist) < _HALF_LANE_WIDTH:
+                deficit = _HALF_LANE_WIDTH - abs(lat_dist)
+                sign    = 1.0 if lat_dist >= 0 else -1.0
+                total_lat += sign * deficit
+
+        offsets.append(total_lat)
+        rgt_vecs.append((rgt_x, rgt_y))
+        in_hard_zone.append(hard)
+
+    # ── Pass 2: build shifted waypoints using _OffsetWP throughout ───────────
+    # Road-snap is NOT used: get_waypoint(project_to_road=True) always returns
+    # the nearest lane *centre*, so any offset smaller than half a lane width
+    # snaps straight back — and even larger offsets snap to the wrong centre.
+    # _OffsetWP preserves the exact shifted coordinates so both hard-zone and
+    # transition-zone dots move together and stay continuous.
+    shifted_route: list = []
+    for i, wp in enumerate(route):
+        lat = offsets[i]
+        if abs(lat) < 1e-4:
+            shifted_route.append(wp)
+            continue
+        wx, wy, wz = route_pts[i]
+        rx, ry     = rgt_vecs[i]
+        shifted_route.append(_OffsetWP(wp, wx + lat * rx, wy + lat * ry, wz))
+
+    # ── Pass 3: insert connecting waypoints wherever the shifted route has gaps ──
+    # Check spatial distance between consecutive shifted waypoints (not offset
+    # delta): in curved/junction sections, a constant lateral offset applied in
+    # a rotating right-direction can create large XY jumps that exceed the AV's
+    # 6 m max_route_deviation and terminate the episode.
+    _MAX_WP_GAP = 1.5   # max allowed metres between consecutive waypoints
+    final_route: list = []
+    i = 0
+    while i < len(shifted_route):
+        final_route.append(shifted_route[i])
+        if i < len(shifted_route) - 1:
+            ax, ay, az = _wp_xyz(shifted_route[i])
+            bx, by, bz = _wp_xyz(shifted_route[i + 1])
+            gap = math.sqrt((bx - ax) ** 2 + (by - ay) ** 2)
+            if gap > _MAX_WP_GAP:
+                n_nodes  = max(1, int(gap / (_MAX_WP_GAP * 0.5)))
+                orig_ref = route[min(i + 1, len(route) - 1)]
+                for k in range(1, n_nodes + 1):
+                    t = k / (n_nodes + 1)
+                    final_route.append(_OffsetWP(
+                        orig_ref,
+                        ax + t * (bx - ax),
+                        ay + t * (by - ay),
+                        az + t * (bz - az),
+                    ))
+        i += 1
+
+    n_offset = sum(1 for wp in final_route if isinstance(wp, _OffsetWP))
+    print(f"[route_detour] {n_offset} offset-WP / {len(final_route)} total  "
+          f"(peak ±{peak_m:.1f} m, +{len(final_route)-n} connecting nodes).")
+    return final_route
+
+
+# ── CUSTOM ROUTE GENERATION ───────────────────────────────────────────────────
+
+def _generate_custom_route(world: object, spawn_tf: object, max_wps: int,
+                           mode: str, params: Optional[dict] = None) -> list:
+    """Walk CARLA's waypoint graph from spawn_tf up to max_wps waypoints.
+
+    mode="straight_left":
+        At each junction prefer the option closest to the current heading
+        (smallest absolute yaw delta).  When no option is within 45° of
+        straight, pick the leftmost turn (most negative yaw delta).
+
+    mode="line_then_left":
+        params: {"target_y": float, "turn_x": float}
+        While x < turn_x: at junctions pick the option whose y is closest
+        to target_y.  Once x >= turn_x: pick leftmost option at every
+        junction (same widening logic as straight_left).
+    """
+    params = params or {}
+    carla_map = world.get_map()  # type: ignore[union-attr]
+    wp = carla_map.get_waypoint(
+        spawn_tf.location,
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving,
+    )
+    if wp is None:
+        return []
+
+    route = [wp]
+    step_m = 1.0
+    _first_turn_done  = False
+    _POST_TURN_SHIFT  = 3.5   # extra metres forward after the first forced turn
+    _turn_indices: list = []   # route indices where a forced turn was taken
+
+    while len(route) < max_wps:
+        nexts = wp.next(step_m)
+        if not nexts:
+            break
+        if len(nexts) == 1:
+            wp = nexts[0]
+        else:
+            cur_yaw = wp.transform.rotation.yaw
+            deltas = []
+            for n in nexts:
+                d = ((n.transform.rotation.yaw - cur_yaw + 180.0) % 360.0) - 180.0
+                deltas.append((abs(d), d, n))
+            deltas.sort(key=lambda x: x[0])
+            if mode == "straight_left" and deltas[0][0] > 45.0:
+                # No straight option — pick leftmost (most negative delta)
+                deltas.sort(key=lambda x: x[1])
+                wp = deltas[0][2]
+                _turn_indices.append(len(route))
+                if not _first_turn_done:
+                    extra = wp.next(_POST_TURN_SHIFT)
+                    if extra:
+                        wp = extra[0]
+                    _first_turn_done = True
+            elif mode == "line_then_left":
+                _target_y   = float(params.get("target_y",  0.0))
+                _turn_x     = float(params.get("turn_x",    100.0))
+                _after_turn = params.get("after_turn", "left")
+                cur_x       = wp.transform.location.x
+                if cur_x < _turn_x and not _first_turn_done:
+                    # Stay near target_y: pick option whose y is closest
+                    wp = min(nexts, key=lambda n: abs(n.transform.location.y - _target_y))
+                elif not _first_turn_done:
+                    # Past turn_x — force left once
+                    deltas.sort(key=lambda x: x[1])
+                    wp = deltas[0][2]
+                    _turn_indices.append(len(route))
+                    extra = wp.next(_POST_TURN_SHIFT)
+                    if extra:
+                        wp = extra[0]
+                    _first_turn_done = True
+                elif _after_turn == "straight":
+                    # After first turn: prefer straightest option
+                    wp = deltas[0][2]
+                else:
+                    # After first turn: keep going left
+                    deltas.sort(key=lambda x: x[1])
+                    wp = deltas[0][2]
+                    _turn_indices.append(len(route))
+            else:
+                wp = deltas[0][2]  # straightest
+        route.append(wp)
+
+    # Widen each turn: shift waypoints in a window around each turn apex outward
+    # (right = outside of a left turn) using a cosine-bell profile so the AV
+    # takes a wider arc and does not drift off on the exit.
+    _WIDEN_M      = 1.2   # peak outward shift in metres
+    _WIDEN_RADIUS = 12    # waypoints each side of apex affected
+
+    class _TurnWP:
+        __slots__ = ("transform", "is_junction")
+        def __init__(self, orig, nx, ny, nz):
+            self.transform   = carla.Transform(
+                carla.Location(x=nx, y=ny, z=nz),
+                orig.transform.rotation,
+            )
+            self.is_junction = bool(getattr(orig, "is_junction", False))
+
+    for t_idx in _turn_indices:
+        for j in range(max(0, t_idx - _WIDEN_RADIUS),
+                       min(len(route), t_idx + _WIDEN_RADIUS)):
+            t      = abs(j - t_idx) / _WIDEN_RADIUS
+            shift  = _WIDEN_M * 0.5 * (1.0 + math.cos(t * math.pi))
+            orig   = route[j]
+            yaw_r  = math.radians(orig.transform.rotation.yaw)
+            rgt_x  =  math.sin(yaw_r)
+            rgt_y  = -math.cos(yaw_r)
+            loc    = orig.transform.location
+            route[j] = _TurnWP(orig, loc.x + shift * rgt_x,
+                                      loc.y + shift * rgt_y,
+                                      loc.z)
+
+    # Virtual obstacle detour: apply the same cosine-bell offset as
+    # _route_around_obstacles but against a list of (x, y) positions in
+    # route_params["virtual_obstacles"].  peak_m defaults to _DETOUR_PEAK_M.
+    _vobs  = params.get("virtual_obstacles", [])
+    _vpeak = float(params.get("peak_m", _DETOUR_PEAK_M))
+    if _vobs:
+        _tr = _WP_CLEAR_RADIUS * _WP_TRANSITION_MULT
+        for i in range(len(route)):
+            orig = route[i]
+            wx = orig.transform.location.x
+            wy = orig.transform.location.y
+            wz = orig.transform.location.z
+            j_lo = max(0, i - 2); j_hi = min(len(route) - 1, i + 2)
+            dx = route[j_hi].transform.location.x - route[j_lo].transform.location.x
+            dy = route[j_hi].transform.location.y - route[j_lo].transform.location.y
+            mag = math.sqrt(dx * dx + dy * dy)
+            if mag < 1e-6:
+                continue
+            fwd_x, fwd_y = dx / mag, dy / mag
+            rgt_x, rgt_y = fwd_y, -fwd_x
+            total_lat = 0.0
+            for ox, oy in _vobs:
+                d = math.sqrt((wx - ox) ** 2 + (wy - oy) ** 2)
+                if d >= _tr:
+                    continue
+                rgt_proj  = (ox - wx) * rgt_x + (oy - wy) * rgt_y
+                direction = -1.0 if rgt_proj >= 0.0 else 1.0
+                if d <= _WP_CLEAR_RADIUS:
+                    total_lat += direction * _vpeak
+                else:
+                    t = (d - _WP_CLEAR_RADIUS) / (_tr - _WP_CLEAR_RADIUS)
+                    total_lat += direction * _vpeak * 0.5 * (1.0 + math.cos(t * math.pi))
+            if abs(total_lat) > 1e-4:
+                route[i] = _TurnWP(orig, wx + total_lat * rgt_x,
+                                         wy + total_lat * rgt_y, wz)
+        print(f"[custom_route] Applied virtual obstacle detour: "
+              f"{len(_vobs)} obstacle(s), peak={_vpeak}m.")
+
+    print(f"[custom_route] Generated {len(route)} waypoints (mode={mode}, "
+          f"{len(_turn_indices)} turn(s) widened ±{_WIDEN_M}m over {_WIDEN_RADIUS*2} wps).")
+    return route
+
+
 # ── PHASE 1: AV HEADLESS RUN ──────────────────────────────────────────────────
 
 def run_av_episode(
@@ -1628,6 +2052,7 @@ def run_av_episode(
     scenario:      str,
     port:          int = 2000,
     mini_scenario: Optional[MiniScenario] = None,
+    headless:      bool = False,
 ) -> Tuple[AVTrajectory, List[AVStepData]]:
     """Headless AV episode. CarlaEnv manages its own CARLA connection.
     UE4 rendering is disabled during this phase for speed.
@@ -1655,13 +2080,19 @@ def run_av_episode(
     _av_client = carla.Client("localhost", port)
     _av_client.set_timeout(30.0)
 
-    # Destroy any vehicles left over from calibration or a previous iteration
+    # Destroy all actors left over from calibration or a previous iteration
     # before CarlaEnv resets the world, so the AV runs in a clean empty world.
     _av_world = _av_client.get_world()
-    _leftover = list(_av_world.get_actors().filter("vehicle.*"))
-    if _leftover:
-        for _a in _leftover:
+    _leftover = [
+        a for a in _av_world.get_actors()
+        if a.type_id.startswith(("vehicle.", "walker.", "sensor.", "controller."))
+    ]
+    for _a in _leftover:
+        try:
             _a.destroy()
+        except Exception:
+            pass
+    if _leftover:
         _av_world.tick()
 
     env = CarlaEnv(_av_client, config)
@@ -1685,61 +2116,187 @@ def run_av_episode(
     tick   = 0
 
     obs, _ = env.reset()
+
     # Truncate route AFTER reset — CarlaEnv.reset() always overwrites max_waypoints
     # from its internal scenario table, so the only reliable way to shorten the
     # route is to slice it here after the fact.
     if mini_scenario is not None:
+        if mini_scenario.route_type:
+            _spawn_pts = _av_world.get_map().get_spawn_points()
+            _spawn_tf  = _spawn_pts[mini_scenario.spawn_index % len(_spawn_pts)]
+            env.route  = _generate_custom_route(_av_world, _spawn_tf, mini_scenario.route_length, mini_scenario.route_type, mini_scenario.route_params)
         env.route = env.route[:mini_scenario.route_length]
         # waypoint_logic uses config.max_waypoints for the done check and index
         # bounds (including a target_wp_ahead lookahead), so it must match the
-        # truncated route length minus the lookahead to stay in bounds.
-        env.config.max_waypoints = len(env.route) - env.config.target_wp_ahead
+        # filtered route length minus the lookahead to stay in bounds.
+        env.config.max_waypoints = max(1, len(env.route) - env.config.target_wp_ahead)
     total  = max(len(env.route), 1)
 
-    # After the map loads, purge every vehicle and walker except the AV hero.
-    # This removes static parked-car props that are baked into the map and would
-    # cause false collision terminations.
-    _hero_id = env.vehicle.id
+    _hero_id  = env.vehicle.id
     _av_world = env.world
+    if headless:
+        # Headless mode: keep no_rendering_mode=True for speed.
+        # A pygame progress window is shown below inside the game loop.
+        try:
+            _rs = _av_world.get_settings()
+            _rs.no_rendering_mode = True
+            _av_world.apply_settings(_rs)
+        except Exception:
+            pass
+    else:
+        # Rendered mode: force UE4 window ON so the user can watch the AV run.
+        try:
+            _rs = _av_world.get_settings()
+            _rs.no_rendering_mode = False
+            _av_world.apply_settings(_rs)
+        except Exception:
+            pass
+
+    # Purge every vehicle and walker except the AV hero so the world is clean
+    # before mini-scenario actors are placed.  This also removes any random
+    # CarlaEnv background traffic whose positions we cannot reproduce for the
+    # human run — keeping only the deterministic mini-scenario actors ensures
+    # both the AV and the human encounter identical traffic.
     _to_destroy = [
         a for a in _av_world.get_actors()
         if (a.type_id.startswith("vehicle.") or a.type_id.startswith("walker."))
         and a.id != _hero_id
     ]
     if _to_destroy:
+        print(f"[av_run] Clearing {len(_to_destroy)} CarlaEnv background actors …")
         for _a in _to_destroy:
             _a.destroy()
         _av_world.tick()
 
-    # Spawn scenario obstacles after world cleanup so they are not swept away.
+    # Spawn scenario obstacles so both AV and human see exactly the same layout.
     # spawn_index is read from the scenario and MUST match the spawnpoint that
     # CarlaEnv used above (see the scenarios table in carla_gym_env.py).  If they
     # diverge, obstacles land off-route and neither the AV nor the human driver
     # will encounter them.
     _obstacle_actors: List[object] = []
     _npc_actors:      List[object] = []
+    _crash_actors:    List[object] = []   # tracked separately for steer-straighten logic
     if mini_scenario is not None:
         _si = mini_scenario.spawn_index
-        _obstacle_actors = _spawn_scenario_obstacles(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
+        _obstacle_actors, _no_detour_ids = _spawn_scenario_obstacles(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
         _npc_actors      = _spawn_npc_autopilot(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
-        _npc_actors     += _spawn_npc_crash(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
+        _crash_actors    = _spawn_npc_crash(_av_world, env.vehicle, mini_scenario, spawn_index=_si)
+        _npc_actors     += _crash_actors
+        print(f"[av_run] Spawned {len(_obstacle_actors)} static obstacle(s) "
+              f"and {len(_npc_actors)} NPC(s) for '{mini_scenario.name}'.")
+        if len(_obstacle_actors) < len(mini_scenario.obstacles):
+            print(f"  WARNING: only {len(_obstacle_actors)}/{len(mini_scenario.obstacles)} "
+                  f"static obstacles spawned — check spawn_index={_si} and blueprint IDs.")
+        if len(_npc_actors) < len(mini_scenario.npc_autopilot) + len(mini_scenario.npc_crash):
+            print(f"  WARNING: only {len(_npc_actors)}/"
+                  f"{len(mini_scenario.npc_autopilot)+len(mini_scenario.npc_crash)} "
+                  f"NPCs spawned — locations may be blocked.")
+        # Apply smooth detour AFTER actors are physically placed so we read their
+        # actual snapped positions (not recomputed from the scenario definition).
+        # Obstacles with entry[6]==False are excluded from detour.
+        _detour_actors = [a for a in _obstacle_actors if a.id not in _no_detour_ids] + _crash_actors
+        if _detour_actors:
+            env.route = _route_around_obstacles(
+                env.route, _detour_actors,
+                peak_m=mini_scenario.detour_peak_m
+                       if mini_scenario.detour_peak_m is not None
+                       else _DETOUR_PEAK_M,
+            )
+            env.config.max_waypoints = max(1, len(env.route) - env.config.target_wp_ahead)
 
 
-    _av_driving_score = 0.0
-    _speed_print_time = time.time()
+    # ── Headless loading screen setup ─────────────────────────────────────────
+    _loading_surf:  object = None   # pygame.Surface or None
+    _loading_font:  object = None
+    _loading_font_sm: object = None
+    if headless and pygame is not None:
+        try:
+            if not pygame.get_init():
+                pygame.init()
+            _lw, _lh = 640, 180
+            import os as _os
+            _os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,60")
+            _loading_surf = pygame.display.set_mode((_lw, _lh))
+            pygame.display.set_caption("AV Pre-run — Loading …")
+            _loading_font    = pygame.font.SysFont("consolas", 20, bold=True)
+            _loading_font_sm = pygame.font.SysFont("consolas", 14)
+        except Exception:
+            _loading_surf = None
+
+    _av_driving_score  = 0.0
+    _speed_print_time  = time.time()
+    _prev_collision_cnt = 0          # for crash detection
+    _stopped_ticks      = 0          # consecutive ticks at near-zero speed
+    _was_stopped        = False
+    _STOP_SPEED_MS      = 0.3        # m/s — below this counts as stopped
+    _STOP_TICKS_THRESH  = FPS // 2   # must be stopped for ≥0.5 s before printing
     try:
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, _, done, _, info = env.step(action)
             sim_t += config.fixed_delta_seconds
 
+            # ── Crash detection ───────────────────────────────────────────────
+            _cur_col_cnt = int(getattr(env, "collision_cnt", 0))
+            if _cur_col_cnt > _prev_collision_cnt:
+                _col_type = info.get("collision_type", "unknown") if isinstance(info, dict) else "unknown"
+                print(f"\n[av_run] *** AV CRASHED ***  t={sim_t:.1f}s  "
+                      f"collision_type={_col_type}  "
+                      f"wp={steps[-1].wp_index if steps else 0}/{total}")
+            _prev_collision_cnt = _cur_col_cnt
+
+            # ── Stop detection ────────────────────────────────────────────────
+            _vel = env.vehicle.get_velocity()
+            _speed_ms = (_vel.x**2 + _vel.y**2 + _vel.z**2) ** 0.5
+            if _speed_ms < _STOP_SPEED_MS:
+                _stopped_ticks += 1
+                if _stopped_ticks == _STOP_TICKS_THRESH and not _was_stopped:
+                    _was_stopped = True
+                    print(f"\n[av_run] *** AV STOPPED ***  t={sim_t:.1f}s  "
+                          f"wp={steps[-1].wp_index if steps else 0}/{total}")
+            else:
+                if _was_stopped:
+                    print(f"[av_run] AV moving again  t={sim_t:.1f}s  "
+                          f"speed={_speed_ms:.2f} m/s")
+                _was_stopped   = False
+                _stopped_ticks = 0
+
             _now = time.time()
             if _now - _speed_print_time >= 1.0:
                 _speed_print_time = _now
-                _vel = env.vehicle.get_velocity()
-                _speed_kmh = ((_vel.x**2 + _vel.y**2 + _vel.z**2) ** 0.5) * 3.6
+                _speed_kmh = _speed_ms * 3.6
                 _limit_kmh = env.vehicle.get_speed_limit()
-                print(f"AV Speed: {_speed_kmh:.1f} km/h  (limit: {_limit_kmh:.0f} km/h)")
+                if not headless:
+                    print(f"AV Speed: {_speed_kmh:.1f} km/h  (limit: {_limit_kmh:.0f} km/h)")
+
+            # ── Update headless loading bar ────────────────────────────────
+            if _loading_surf is not None:
+                try:
+                    pygame.event.pump()
+                    _ratio = min(len(steps) / max(total, 1), 1.0)
+                    _lw2, _lh2 = _loading_surf.get_size()  # type: ignore[union-attr]
+                    _loading_surf.fill((18, 18, 18))  # type: ignore[union-attr]
+                    _sc_name = mini_scenario.name if mini_scenario else scenario
+                    _title = _loading_font.render(  # type: ignore[union-attr]
+                        f"AV Pre-run: {_sc_name}", True, (220, 220, 220))
+                    _loading_surf.blit(_title, (20, 18))  # type: ignore[union-attr]
+                    # Progress bar background
+                    _bx, _by, _bw, _bh = 20, 70, _lw2 - 40, 36
+                    pygame.draw.rect(_loading_surf, (45, 45, 45), (_bx, _by, _bw, _bh), border_radius=6)
+                    # Filled portion
+                    _fill = max(4, int(_bw * _ratio))
+                    pygame.draw.rect(_loading_surf, (0, 170, 90), (_bx, _by, _fill, _bh), border_radius=6)
+                    # Percentage label
+                    _pct_txt = _loading_font.render(  # type: ignore[union-attr]
+                        f"{_ratio * 100:.0f}%", True, (255, 255, 255))
+                    _loading_surf.blit(_pct_txt, (_bx + _bw // 2 - _pct_txt.get_width() // 2, _by + 5))  # type: ignore[union-attr]
+                    # Step counter
+                    _step_txt = _loading_font_sm.render(  # type: ignore[union-attr]
+                        f"step {len(steps)} / {total}  |  sim {sim_t:.0f}s", True, (140, 140, 140))
+                    _loading_surf.blit(_step_txt, (20, 124))  # type: ignore[union-attr]
+                    pygame.display.flip()
+                except Exception:
+                    pass
 
             if done:
                 _av_driving_score = float(info.get('adjusted_driving_core', 0.0))
@@ -1773,6 +2330,16 @@ def run_av_episode(
                 total_waypoints=total,
             ))
             tick += 1
+            # After 1 s of sim time, straighten crash NPCs so they drive off in a
+            # straight line instead of looping in circles.
+            if tick == FPS and _crash_actors:
+                for _ca in _crash_actors:
+                    try:
+                        _ca.apply_control(carla.VehicleControl(  # type: ignore[union-attr]
+                            throttle=0.7, steer=0.0, brake=0.0))
+                    except Exception:
+                        pass
+                print(f"[av_run] Crash NPCs straightened after 1 s.")
             if tick % FPS == 0:
                 print(f"  [av_run] t={sim_t:.1f}s  wp={steps[-1].wp_index}/{total}"
                       f"  speed={steps[-1].speed:.1f}m/s")
@@ -1783,6 +2350,25 @@ def run_av_episode(
             except Exception:
                 pass
         env.close()
+        # Comprehensive post-episode actor wipe — env.close() does not guarantee
+        # all sensors/controllers/walkers are gone, causing accumulation over runs.
+        import gc
+        try:
+            _post_world = _av_client.get_world()
+            _post_actors = [
+                a for a in _post_world.get_actors()
+                if a.type_id.startswith(("vehicle.", "walker.", "sensor.", "controller."))
+            ]
+            for _a in _post_actors:
+                try:
+                    _a.destroy()
+                except Exception:
+                    pass
+            if _post_actors:
+                _post_world.tick()
+        except Exception:
+            pass
+        gc.collect()
 
     prog = steps[-1].progress() * 100 if steps else 0.0
     print(f"\n[av_run] DONE → {len(steps)} steps, route completion {prog:.1f}%")
@@ -1792,17 +2378,17 @@ def run_av_episode(
 # ── PHASE 2: HUMAN RUN WITH ALERTS ────────────────────────────────────────────
 
 def run_human_episode(
-    client:        object,
-    world:         object,
-    traj:          AVTrajectory,
-    av_steps:      List[AVStepData],
-    av_style:      np.ndarray,
-    alert_model:   MoEAlertModel,
-    max_duration:  float = 300.0,
-    force_arrow:   bool  = False,
-    test_mode:     bool  = False,
-    mini_scenario: Optional[MiniScenario] = None,
-) -> List[HumanStepData]:
+    client:           object,
+    world:            object,
+    traj:             AVTrajectory,
+    av_steps:         List[AVStepData],
+    alert_model:      MoEAlertModel,
+    max_duration:     float = 300.0,
+    force_arrow:      bool  = False,
+    test_mode:        bool  = False,
+    mini_scenario:    Optional[MiniScenario] = None,
+    session_deadline: Optional[float] = None,   # wall-clock time.time() deadline; None = no limit
+) -> Tuple[List[HumanStepData], float, float]:
     """Human drives with alert overlays drawn into the UE4 window.
 
     Alert model is sampled ONCE at episode start.
@@ -1828,14 +2414,55 @@ def run_human_episode(
     hero  = _spawn_hero(world, spawn_index=_si)
     regressor = HumanStyleRegressor()
     regressor.attach_collision_sensor(world, hero)
+
+    # ── Sensors for human driving-score accumulators ───────────────────────
+    _world_map = world.get_map()
+    _bp_lib    = world.get_blueprint_library()
+
+    _collision_cnt_env:    int   = 0
+    _collision_cnt_car:    int   = 0
+    _lane_invasion_cnt:    int   = 0
+    _total_dist_to_center: float = 0.0
+    _speeding_cnt:         int   = 0
+    _episode_ticks:        int   = 0
+    _timeout_flag:         float = 0.0
+    _final_x:              float = 0.0
+    _final_y:              float = 0.0
+
+    def _on_collision_typed(event) -> None:
+        nonlocal _collision_cnt_env, _collision_cnt_car
+        if 'vehicle' in event.other_actor.type_id:
+            _collision_cnt_car += 1
+        else:
+            _collision_cnt_env += 1
+
+    def _on_lane_invasion(_event) -> None:
+        nonlocal _lane_invasion_cnt
+        _lane_invasion_cnt += 1
+
+    _typed_collision_sensor = world.spawn_actor(
+        _bp_lib.find('sensor.other.collision'),
+        carla.Transform(), attach_to=hero,
+    )
+    _typed_collision_sensor.listen(_on_collision_typed)
+
+    _lane_inv_sensor = world.spawn_actor(
+        _bp_lib.find('sensor.other.lane_invasion'),
+        carla.Transform(), attach_to=hero,
+    )
+    _lane_inv_sensor.listen(_on_lane_invasion)
+    # ──────────────────────────────────────────────────────────────────────
+
     world.tick()  # settle hero physics so get_location().z is accurate for obstacle z
 
     _obstacle_actors: List[object] = []
     _npc_actors:      List[object] = []
+    _crash_actors:    List[object] = []
     if mini_scenario is not None:
-        _obstacle_actors = _spawn_scenario_obstacles(world, hero, mini_scenario, spawn_index=_si)
+        _obstacle_actors, _ = _spawn_scenario_obstacles(world, hero, mini_scenario, spawn_index=_si)
         _npc_actors      = _spawn_npc_autopilot(world, hero, mini_scenario, spawn_index=_si)
-        _npc_actors     += _spawn_npc_crash(world, hero, mini_scenario, spawn_index=_si)
+        _crash_actors    = _spawn_npc_crash(world, hero, mini_scenario, spawn_index=_si)
+        _npc_actors     += _crash_actors
 
     # ── Sample alert ONCE ─────────────────────────────────────────────────
     # Use the calibrated style profile as the initial state.  Since style is
@@ -1845,12 +2472,14 @@ def run_human_episode(
     init_state = _build_state(hero, init_meas, first_av, 0.0, 0.0)
     alert, log_prob = alert_model.sample(init_state)
     if force_arrow:
-        alert.gui_type   = 0
-        alert.gui_params = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        # Guarantee a visible lag so the arrow shows a future position, not the
-        # AV's current position.  Clamp to MAX_LAG in case the model went high.
-        alert.lag = float(np.clip(max(alert.lag, 1.0), 0.0, MAX_LAG))
-        print(f"[human_run] force_arrow=True — gui_type=arrow, lag={alert.lag:.2f}s")
+        _rng = np.random.default_rng()
+        alert.gui_type   = 0                                          # arrow
+        alert.color      = 0                                          # standard RGB (red/green)
+        alert.location   = int(_rng.integers(0, 2))                   # random windshield/panel
+        alert.vibration  = int(_rng.integers(0, 2))                   # random on/off
+        alert.lag        = float(_rng.uniform(0.5, MAX_LAG))          # random 0.5–2.0 s
+        alert.gui_params = _rng.random(3).astype(np.float32)          # random scale/opacity/vib_dist
+        print(f"[human_run] force_arrow=True — fixed arrow, random params, lag={alert.lag:.2f}s")
     alert_raw = alert.to_raw()
 
     print(f"\n[human_run] ── Episode alert (FIXED for this run) ──────────────")
@@ -1870,7 +2499,8 @@ def run_human_episode(
     av_end_t    = av_steps[-1].sim_time if av_steps else max_duration
     ctrl_reader = ControlReader()
     clock       = pygame.time.Clock()
-    step_log: List[HumanStepData] = []
+    step_log:   List[HumanStepData] = []
+    _ep_dists:  List[float]         = []   # euclidean distance human↔AV each tick
     sim_t = 0.0
     tick  = 0
 
@@ -1882,6 +2512,9 @@ def run_human_episode(
             if ctrl_reader.quit_request:
                 print("[human_run] User ended episode early (Q pressed).")
                 break
+            if session_deadline is not None and time.time() >= session_deadline:
+                print(f"[human_run] Session time limit reached — stopping script.")
+                raise SystemExit(0)
 
             ctrl = ctrl_reader.read()
             hero.apply_control(ctrl)
@@ -1890,21 +2523,50 @@ def run_human_episode(
             sim_t += _DT
             tick  += 1
 
+            # Straighten crash NPCs after 1 s so they drive off straight
+            # instead of looping in circles with constant steer.
+            if tick == FPS and _crash_actors:
+                for _ca in _crash_actors:
+                    try:
+                        _ca.apply_control(carla.VehicleControl(
+                            throttle=0.7, steer=0.0, brake=0.0))
+                    except Exception:
+                        pass
+
             meas        = CarlaEnvUtils.get_vehicle_measurements(hero)
             human_style = regressor.tick(hero, world, _DT)
             av_step     = _nearest_av(av_steps, sim_t)
             progress    = float(np.clip(sim_t / max(av_end_t, 1e-9), 0.0, 1.0))
 
+            loc  = hero.get_location()
+
+            # ── Human driving-score accumulators (same metrics as AV env) ─
+            _road_wp = _world_map.get_waypoint(loc, project_to_road=True)
+            if _road_wp is not None:
+                _wl = _road_wp.transform.location
+                _total_dist_to_center += math.sqrt(
+                    (loc.x - _wl.x) ** 2 + (loc.y - _wl.y) ** 2
+                )
+            if float(meas[0]) > float(CarlaEnvUtils.get_speed_limit_ms(hero)):
+                _speeding_cnt += 1
+            _episode_ticks += 1
+            _final_x = loc.x
+            _final_y = loc.y
+            # ──────────────────────────────────────────────────────────────
+
             next_pos = traj.get_position_at(sim_t + 1.0)
             if next_pos is not None:
-                hloc   = hero.get_location()
                 hyaw   = math.radians(hero.get_transform().rotation.yaw)
-                wp_ang = (math.atan2(next_pos[1] - hloc.y,
-                                     next_pos[0] - hloc.x) - hyaw)
+                wp_ang = (math.atan2(next_pos[1] - loc.y,
+                                     next_pos[0] - loc.x) - hyaw)
             else:
                 wp_ang = 0.0
 
-            score = _deviation_score(human_style, av_style)
+            # Per-tick reward: 1 - euclidean distance between human and AV positions.
+            # Closer to the AV route → smaller distance → higher reward.
+            _dist = math.sqrt((loc.x - av_step.x) ** 2 + (loc.y - av_step.y) ** 2)
+            _ep_dists.append(_dist)
+            score = 1.0 - _dist
 
             # ── CARLA debug rendering ─────────────────────────────────────
             if test_mode:
@@ -1912,14 +2574,24 @@ def run_human_episode(
             else:
                 draw_alert(world, alert, hero, traj, sim_t)
             _spectator_follow(world, hero)
-
-            loc = hero.get_location()
+            vel  = hero.get_velocity()
+            htf2 = hero.get_transform()
+            _h2y = math.radians(htf2.rotation.yaw)
+            _hx2 = loc.x + vel.x * _DT + 0.8 * math.cos(_h2y)
+            _hy2 = loc.y + vel.y * _DT + 0.8 * math.sin(_h2y)
+            _hz2 = loc.z + vel.z * _DT + 1.3
             world.debug.draw_string(
-                location=carla.Location(x=loc.x, y=loc.y, z=loc.z + 5.0),
+                location=carla.Location(x=_hx2, y=_hy2, z=_hz2 + 0.5),
                 text=(f"t={sim_t:.0f}s  align={score:.2f}  "
                       + "  ".join(f"{l[0]}:{v:.2f}"
                                   for l, v in zip(STYLE_LABELS, human_style))),
                 color=carla.Color(r=200, g=230, b=200),
+                life_time=_DRAW_LT,
+            )
+            world.debug.draw_string(
+                location=carla.Location(x=_hx2, y=_hy2, z=_hz2 + 0.1),
+                text=f"x={loc.x:.1f}  y={loc.y:.1f}  z={loc.z:.1f}",
+                color=carla.Color(r=255, g=255, b=100),
                 life_time=_DRAW_LT,
             )
 
@@ -1951,15 +2623,36 @@ def run_human_episode(
                 _obs.destroy()
             except Exception:
                 pass
+        for _s in (_typed_collision_sensor, _lane_inv_sensor):
+            try:
+                _s.stop()
+                _s.destroy()
+            except Exception:
+                pass
         ctrl_reader.close()
         regressor.destroy_collision_sensor()
         hero.destroy()
         print("[human_run] Hero destroyed.")
 
-    mean_score = np.mean([s.alert_score for s in step_log]) if step_log else 0.0
-    print(f"\n[human_run] DONE → {len(step_log)} steps, "
-          f"mean alignment score={mean_score:.3f}")
-    return step_log
+    mean_dist = float(np.mean(_ep_dists)) if _ep_dists else 0.0
+
+    # ── Human driving score — identical formula to AV adjusted_driving_core ──
+    _total_wps     = av_steps[-1].total_waypoints if av_steps else 1
+    _final_av_step = _nearest_av_by_position(av_steps, _final_x, _final_y)
+    _route_comp    = float(_final_av_step.wp_index) / max(float(_total_wps - 1), 1.0)
+    _avg_dist_ctr  = _total_dist_to_center / max(_episode_ticks, 1)
+    human_driving_score = _compute_human_driving_score(
+        _avg_dist_ctr, _collision_cnt_env, _collision_cnt_car,
+        _lane_invasion_cnt, _speeding_cnt / FPS, _timeout_flag, _route_comp,
+    )
+
+    print(f"\n[human_run] DONE → {len(step_log)} steps  "
+          f"mean_euclidean_dist={mean_dist:.3f}m  "
+          f"human_driving_score={human_driving_score:.3f}")
+    print(f"  route_completion={_route_comp:.3f}  avg_lane_dist={_avg_dist_ctr:.3f}m  "
+          f"collisions(env={_collision_cnt_env} car={_collision_cnt_car})  "
+          f"lane_inv={_lane_invasion_cnt}  speeding_ticks={_speeding_cnt}")
+    return step_log, mean_dist, human_driving_score
 
 
 # ── PHASE 3: TRAINING FLUSH ───────────────────────────────────────────────────
@@ -2004,7 +2697,7 @@ class AlertPipeline:
         model_path:           str,
         scenario:             str  = "intersection",
         calibration_duration: int  = 20,
-        max_iterations:       int  = 20,
+        max_iterations:       int  = 25,
         host:                 str  = "localhost",
         port:                 int  = 2000,
         save_dir:             str   = "./pipeline_runs",
@@ -2012,6 +2705,9 @@ class AlertPipeline:
         session_duration:     float = 25 * 60,
         alert_mode:           str   = "adaptive",
         av_speedup:           float = 2.0,
+        tutorial_duration:    int   = _TUTORIAL_DURATION,
+        start_scenario:       int   = 0,
+        headless_av:          bool  = False,
     ) -> None:
         if alert_mode not in ("fixed", "adaptive", "test"):
             raise ValueError(f"alert_mode must be 'fixed', 'adaptive', or 'test', got {alert_mode!r}")
@@ -2027,6 +2723,9 @@ class AlertPipeline:
         self.session_duration     = session_duration
         self.alert_mode           = alert_mode
         self.av_speedup           = av_speedup
+        self.tutorial_duration    = tutorial_duration
+        self.start_scenario       = start_scenario
+        self.headless_av          = headless_av
 
         self.alert_model    = MoEAlertModel(state_dim=DEFAULT_STATE_DIM)
         self.style_profile: Optional[np.ndarray] = None
@@ -2035,9 +2734,15 @@ class AlertPipeline:
         # Per-participant CSV log
         self._participant_csv = self.save_dir / f"participant_{participant_number}_log.csv"
         with open(self._participant_csv, "w", newline="") as _f:
-            csv.writer(_f).writerow(
-                ["participant_number", "scenario", "iteration", "driving_score", "episode_loss"]
-            )
+            csv.writer(_f).writerow([
+                "participant_number", "scenario", "iteration",
+                "driving_score", "episode_loss",
+                "style_speed", "style_efficiency", "style_aggressiveness", "style_comfort",
+                "gui_type", "gui_location", "gui_color", "gui_vibration", "gui_lag",
+                "gui_p0_name", "gui_p0_val",
+                "gui_p1_name", "gui_p1_val",
+                "gui_p2_name", "gui_p2_val",
+            ])
 
         print(f"[pipeline] Ready. Saving to: {self.save_dir.resolve()}")
 
@@ -2078,54 +2783,55 @@ class AlertPipeline:
     # ── Run ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        # ── Phase -1: Pre-run every scenario's AV trajectory (cached to disk) ──
-        # This is done ONCE before calibration so the main session loop never
-        # has to wait for an AV run.  The cache is keyed by speedup factor so
-        # changing --av-speedup invalidates the old cache automatically.
-        _cache_path = self.save_dir / f"av_prerun_spd{self.av_speedup:.2f}.pkl"
-        if _cache_path.exists():
-            with open(_cache_path, "rb") as _f:
-                _prerun_cache: List[tuple] = pickle.load(_f)
-            print(f"[pipeline] Loaded {len(_prerun_cache)} pre-run trajectories from cache.")
-        else:
-            _default_style = np.array([0.6, 0.2, 0.1, 0.1], dtype=np.float32)
-            _prerun_cache  = []
-            print(f"\n[pipeline] Pre-running {len(MINI_SCENARIOS)} AV scenarios "
-                  f"(speedup={self.av_speedup:.1f}x) …")
-            for _i, _ms in enumerate(MINI_SCENARIOS):
-                print(f"  [{_i+1}/{len(MINI_SCENARIOS)}] {_ms.name}")
-                try:
-                    _traj, _av_st, _av_sc = run_av_episode(
-                        self.model_path, _default_style, _ms.base_scenario, self.port,
-                        mini_scenario=_ms,
-                    )
-                    for _pt in _traj._points:
-                        _pt.t /= self.av_speedup
-                    for _st in _av_st:
-                        _st.sim_time /= self.av_speedup
-                    _prerun_cache.append((_ms, _traj, _av_st, _av_sc))
-                except Exception:
-                    import traceback
-                    print(f"  WARNING: {_ms.name} pre-run failed — skipped.\n"
-                          + traceback.format_exc())
-            with open(_cache_path, "wb") as _f:
-                pickle.dump(_prerun_cache, _f)
-            print(f"[pipeline] {len(_prerun_cache)}/{len(MINI_SCENARIOS)} scenarios cached.")
-
-        if not _prerun_cache:
-            raise RuntimeError("No AV scenarios pre-computed successfully — cannot continue.")
-
-        # ── Phase 0: Calibration ──────────────────────────────────────────────
+        # ── Phase 0: Tutorial + Calibration ──────────────────────────────────
+        # Calibration runs FIRST so the AV pre-runs use the participant's real
+        # style profile rather than a generic default.
         cal_map = _SCENARIO_MAPS.get(MINI_SCENARIOS[0].base_scenario, "Town01")
         client, world = _connect(self.host, self.port, render=True)
         world = _load_map(client, world, cal_map)
         try:
-            run_tutorial(client, world)
+            if self.tutorial_duration > 0:
+                run_tutorial(client, world, duration=self.tutorial_duration)
             print(f"\n[pipeline] Starting calibration ({self.calibration_duration}s) …")
             self.style_profile = run_calibration(client, world, self.calibration_duration)
         finally:
             _disconnect(world)
         print(f"[pipeline] Style profile: {self.style_profile.tolist()}")
+
+        # ── Phase 1: Pre-run every scenario's AV trajectory ───────────────────
+        # Always recalculated fresh after calibration so trajectories reflect
+        # the participant's actual style profile.
+        _active_scenarios = MINI_SCENARIOS[self.start_scenario:]
+        if self.start_scenario:
+            print(f"\n[pipeline] Starting from scenario {self.start_scenario} "
+                  f"({MINI_SCENARIOS[self.start_scenario].name}) — "
+                  f"{len(_active_scenarios)} scenario(s) active.")
+        _prerun_cache: List[tuple] = []
+        print(f"\n[pipeline] Pre-running {len(_active_scenarios)} AV scenarios "
+              f"with participant style (speedup={self.av_speedup:.1f}x) …", flush=True)
+        for _i, _ms in enumerate(_active_scenarios):
+            _sid = self.start_scenario + _i
+            print(f"  [{_i+1}/{len(_active_scenarios)}]  scenario {_sid}: {_ms.name}", flush=True)
+            try:
+                _traj, _av_st, _av_sc = run_av_episode(
+                    self.model_path, self.style_profile, _ms.base_scenario, self.port,
+                    mini_scenario=_ms,
+                    headless=self.headless_av,
+                )
+                for _pt in _traj._points:
+                    _pt.t     /= self.av_speedup
+                    _pt.speed *= self.av_speedup
+                for _st in _av_st:
+                    _st.sim_time /= self.av_speedup
+                _prerun_cache.append((_ms, _traj, _av_st, _av_sc))
+            except Exception:
+                import traceback
+                print(f"  WARNING: {_ms.name} pre-run failed — skipped.\n"
+                      + traceback.format_exc())
+        print(f"[pipeline] {len(_prerun_cache)}/{len(_active_scenarios)} scenarios pre-run.")
+
+        if not _prerun_cache:
+            raise RuntimeError("No AV scenarios pre-computed successfully — cannot continue.")
 
         # ── Scenario loop ─────────────────────────────────────────────────────
         # Randomly pick from pre-computed trajectories.  Only human-drive time
@@ -2133,57 +2839,148 @@ class AlertPipeline:
         print(f"\n[pipeline] Alert mode: {self.alert_mode.upper()}")
         print(f"[pipeline] Session: {self.session_duration/60:.1f} min of human drive time")
         session_human_elapsed = 0.0
+        _session_wall_start   = time.time()
+        _session_wall_end     = _session_wall_start + self.session_duration
         scenario_idx = 0
-        while session_human_elapsed < self.session_duration:
+        _plot_av_scores:    List[float] = []   # AV driving reward per iteration
+        _plot_align_scores: List[float] = []   # mean human-AV alignment per iteration
+        while (session_human_elapsed < self.session_duration
+               and scenario_idx < self.max_iterations):
             elapsed_min   = session_human_elapsed / 60
             remaining_min = (self.session_duration - session_human_elapsed) / 60
-            mini, traj, av_steps, av_driving_score = random.choice(_prerun_cache)
+            mini, traj, av_steps, _ = random.choice(_prerun_cache)
             scenario_map  = _SCENARIO_MAPS.get(mini.base_scenario, "Town01")
 
-            print(f"\n{'#'*60}")
-            print(f"# ITERATION {scenario_idx+1}  —  {mini.name.upper()}")
-            print(f"# Alert mode : {self.alert_mode.upper()}")
-            print(f"# Driven     : {elapsed_min:.1f} min  |  Remaining: {remaining_min:.1f} min")
-            print(f"{'#'*60}")
+            _scenario_id = next((i for i, ms in enumerate(MINI_SCENARIOS) if ms is mini), -1)
+            _w = 72
+            _sep = "=" * _w
+            _tag = f"  SCENARIO {_scenario_id} : {mini.name.upper()}  "
+            _tag = _tag.center(_w)
+            _iter = f"  iteration {scenario_idx+1}  |  {elapsed_min:.1f} min elapsed  |  {remaining_min:.1f} min left  "
+            _iter = _iter.center(_w)
+            print(f"\n{_sep}", flush=True)
+            print(_sep, flush=True)
+            print(_tag, flush=True)
+            print(_iter, flush=True)
+            print(_sep, flush=True)
+            print(_sep, flush=True)
 
             try:
                 # Phase 2 — human run (counted against session clock)
                 client, world = _connect(self.host, self.port, render=True)
-                world = _load_map(client, world, scenario_map)
+                # Force a full world reload every 5 iterations to flush CARLA's
+                # accumulated actor/resource state and prevent server degradation.
+                if scenario_idx > 0 and scenario_idx % 5 == 0:
+                    print(f"[pipeline] Reloading world to flush CARLA state "
+                          f"(iteration {scenario_idx + 1}) …", flush=True)
+                    world = client.load_world(scenario_map)
+                    s = world.get_settings()
+                    s.synchronous_mode    = True
+                    s.fixed_delta_seconds = _DT
+                    s.no_rendering_mode   = False
+                    world.apply_settings(s)
+                else:
+                    world = _load_map(client, world, scenario_map)
                 _human_start = time.time()
                 try:
-                    step_log = run_human_episode(
+                    step_log, mean_euclidean_dist, human_driving_score = run_human_episode(
                         client, world, traj, av_steps,
-                        self.style_profile, self.alert_model,
+                        self.alert_model,
                         force_arrow=(self.alert_mode == "fixed"),
                         test_mode=(self.alert_mode == "test"),
                         mini_scenario=mini,
+                        session_deadline=_session_wall_end,
                     )
-                    # Score display between scenarios (world still active)
-                    if step_log:
-                        _mean_align = float(np.mean([s.alert_score for s in step_log]))
-                        _show_score_between(
-                            world, mini.name, scenario_idx + 1,
-                            av_driving_score, _mean_align,
-                            duration=4.0,
-                        )
                 finally:
+                    # Destroy all remaining actors before releasing sync mode so
+                    # nothing accumulates across episodes.
+                    import gc
+                    try:
+                        _leftover_h = [
+                            a for a in world.get_actors()
+                            if a.type_id.startswith(
+                                ("vehicle.", "walker.", "sensor.", "controller."))
+                        ]
+                        for _a in _leftover_h:
+                            try:
+                                _a.destroy()
+                            except Exception:
+                                pass
+                        if _leftover_h:
+                            world.tick()
+                    except Exception:
+                        pass
+                    gc.collect()
                     _disconnect(world)
+
                 session_human_elapsed += time.time() - _human_start
 
-                # Phase 3 — train
-                loss = flush_training(self.alert_model, step_log)
-                self._loss_history.append(loss)
+                # Phase 3 — train (must run before score display so we have the loss)
+                flush_training(self.alert_model, step_log)
+
+                # Alert loss: mean euclidean distance (metres) between the human's
+                # position and the synchronised AV position throughout the run.
+                alert_loss = mean_euclidean_dist
+
+                # Track per-iteration metrics for end-of-session plots
+                _plot_av_scores.append(human_driving_score)
+                _plot_align_scores.append(alert_loss)
+
+                # Large pygame score screen (shown after training completes)
+                if step_log:
+                    _show_score_pygame(
+                        mini.name, scenario_idx + 1,
+                        human_driving_score, alert_loss,
+                        duration=10.0,
+                    )
+                self._loss_history.append(alert_loss)
                 self._save_csv(step_log, scenario_idx)
                 self._save(scenario_idx)
                 with open(self._participant_csv, "a", newline="") as _f:
+                    # Mean style scores across all ticks of this episode
+                    _ep_styles = np.mean(
+                        [s.style_scores for s in step_log], axis=0
+                    ).tolist() if step_log else [0.0, 0.0, 0.0, 0.0]
+                    # Alert vector (fixed for episode — read from first step)
+                    _ep_av = AlertVector.from_raw(
+                        np.array(step_log[0].alert_raw, dtype=np.float32)
+                    ) if step_log else None
+                    _pnames = _ep_av.param_names if _ep_av else ["p0", "p1", "p2"]
+                    _pvals  = _ep_av.gui_params.tolist() if _ep_av else [0.0, 0.0, 0.0]
                     csv.writer(_f).writerow([
                         self.participant_number, mini.name, scenario_idx,
-                        av_driving_score, loss,
+                        human_driving_score, alert_loss,
+                        # style
+                        round(_ep_styles[0], 4), round(_ep_styles[1], 4),
+                        round(_ep_styles[2], 4), round(_ep_styles[3], 4),
+                        # alert GUI metadata
+                        _ep_av.gui_name if _ep_av else "",
+                        "windshield" if (_ep_av and _ep_av.location) else "panel",
+                        "colorblind" if (_ep_av and _ep_av.color) else "RGB",
+                        bool(_ep_av.vibration) if _ep_av else False,
+                        round(_ep_av.lag, 3) if _ep_av else 0.0,
+                        _pnames[0], round(_pvals[0], 4),
+                        _pnames[1], round(_pvals[1], 4),
+                        _pnames[2], round(_pvals[2], 4),
                     ])
 
+                _style_str = "  ".join(
+                    f"{l}={v:.3f}" for l, v in zip(STYLE_LABELS, _ep_styles)
+                )
+                _gui_str = (
+                    f"{_ep_av.gui_name}  lag={_ep_av.lag:.2f}s  "
+                    f"loc={'windshield' if _ep_av.location else 'panel'}  "
+                    f"color={'colorblind' if _ep_av.color else 'RGB'}  "
+                    f"vib={bool(_ep_av.vibration)}  "
+                    + "  ".join(
+                        f"{n}={v:.3f}" for n, v in zip(_pnames, _pvals)
+                    )
+                ) if _ep_av else "N/A"
                 print(f"\n[pipeline] Iteration {scenario_idx+1} ('{mini.name}') done.  "
-                      f"Loss={loss:.4f}  History={[f'{v:.4f}' for v in self._loss_history]}")
+                      f"HumanScore={human_driving_score:.4f}  AlertLoss={alert_loss:.4f}m  "
+                      f"History={[f'{v:.4f}' for v in self._loss_history]}")
+                print(f"  HumanStyle  : {_style_str}")
+                print(f"  Alert GUI   : {_gui_str}")
 
             except Exception:
                 import traceback
@@ -2194,6 +2991,40 @@ class AlertPipeline:
 
         print(f"\n[pipeline] Session complete after {scenario_idx} iteration(s) "
               f"({session_human_elapsed/60:.1f} min driven).")
+
+        # ── Auto-generate session plots ────────────────────────────────────────
+        if _plot_av_scores:
+            try:
+                import matplotlib
+                matplotlib.use("Agg")           # non-interactive — saves to file, no GUI
+                import matplotlib.pyplot as plt  # type: ignore[import]
+
+                iters = list(range(1, len(_plot_av_scores) + 1))
+
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+                fig.suptitle(f"Participant {self.participant_number} — Session Summary",
+                             fontsize=14, fontweight="bold")
+
+                ax1.plot(iters, _plot_av_scores, "b-o", linewidth=2, markersize=6)
+                ax1.set_ylabel("Human Driving Score (0–1)")
+                ax1.set_title("Human Driving Score per Iteration")
+                ax1.set_ylim(0, max(1.0, max(_plot_av_scores) * 1.1))
+                ax1.grid(True, alpha=0.3)
+
+                ax2.plot(iters, _plot_align_scores, "r-o", linewidth=2, markersize=6)
+                ax2.set_ylabel("Mean Euclidean Distance (m)")
+                ax2.set_title("Alert Loss (Mean Human↔AV Euclidean Distance) per Iteration")
+                ax2.set_xlabel("Iteration")
+                ax2.set_ylim(0, max(1.0, max(_plot_align_scores) * 1.1))
+                ax2.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                _plot_path = self.save_dir / f"session_plots_p{self.participant_number}.png"
+                plt.savefig(str(_plot_path), dpi=150)
+                plt.close(fig)
+                print(f"[pipeline] Plots saved → {_plot_path}")
+            except Exception as _pe:
+                print(f"[pipeline] WARNING: could not generate plots: {_pe}")
 
 
 # ── SMOKE TEST (--test flag, no CARLA required) ───────────────────────────────
@@ -2259,6 +3090,111 @@ def _run_smoke_test() -> None:
     print("="*60)
 
 
+# ── TEST-MODE RUNNER ──────────────────────────────────────────────────────────
+
+def _run_test_mode(
+    model_path:           str,
+    scenario_id:          int   = 0,
+    host:                 str   = "localhost",
+    port:                 int   = 2000,
+    alert_mode:           str   = "adaptive",
+    av_speedup:           float = 1.0,
+    calibration_duration: int   = 0,
+) -> None:
+    """Single-scenario debug loop: (optional calibration →) AV run → human run.
+
+    Use ``--test-mode --scenario-id N`` on the command line.
+    If ``--calibration-duration`` is provided (> 0) the participant drives freely
+    first and the resulting style profile is used for the AV.  Otherwise a
+    neutral profile is used (speed=0.6, all others=0.5).
+    The human run uses a freshly-initialised MoEAlertModel so the prompt
+    system fires exactly as it would in a real session.
+    """
+    if scenario_id < 0 or scenario_id >= len(MINI_SCENARIOS):
+        raise SystemExit(
+            f"--scenario-id {scenario_id} is out of range "
+            f"(0 – {len(MINI_SCENARIOS)-1}).  "
+            f"Run with --list-scenarios to see valid IDs."
+        )
+
+    ms = MINI_SCENARIOS[scenario_id]
+    print(f"\n{'='*60}")
+    print(f"TEST MODE  scenario_id={scenario_id}  name='{ms.name}'")
+    print(f"  base_scenario : {ms.base_scenario}")
+    print(f"  spawn_index   : {ms.spawn_index}")
+    print(f"  obstacles     : {ms.obstacles}")
+    print(f"  npc_crash     : {ms.npc_crash}")
+    print(f"  route_length  : {ms.route_length}")
+    print(f"{'='*60}\n")
+
+    # ── Calibration (optional) ────────────────────────────────────────────────
+    if calibration_duration > 0:
+        print(f"[test_mode] Running calibration ({calibration_duration}s) …")
+        cal_map = _SCENARIO_MAPS.get(ms.base_scenario, "Town01")
+        _cal_client, _cal_world = _connect(host, port, render=True)
+        _cal_world = _load_map(_cal_client, _cal_world, cal_map)
+        try:
+            style = run_calibration(_cal_client, _cal_world, calibration_duration)
+        finally:
+            _disconnect(_cal_world)
+        print(f"[test_mode] Style profile from calibration: {style.tolist()}")
+    else:
+        # Neutral style — speed floored so the AV actually moves
+        style = np.array([0.6, 0.5, 0.5, 0.5], dtype=np.float32)
+        print(f"[test_mode] Using neutral style profile (no calibration).")
+
+    # ── Phase 1: AV run ───────────────────────────────────────────────────────
+    print("[test_mode] Running AV episode …")
+    traj, av_steps, av_score = run_av_episode(
+        model_path=model_path,
+        style_profile=style,
+        scenario=ms.base_scenario,
+        port=port,
+        mini_scenario=ms,
+        headless=False,
+    )
+    # Apply speedup (default 1× in test mode so the human sees real AV speed)
+    if av_speedup != 1.0:
+        for pt in traj._points:
+            pt.t     /= av_speedup
+            pt.speed *= av_speedup
+        for st in av_steps:
+            st.sim_time /= av_speedup
+
+    print(f"[test_mode] AV done — {len(av_steps)} steps, score={av_score:.3f}")
+
+    # ── Phase 2: Human run ────────────────────────────────────────────────────
+    print("[test_mode] Starting human episode …")
+    scenario_map = _SCENARIO_MAPS.get(ms.base_scenario, "Town01")
+    client, world = _connect(host, port, render=True)
+    world = _load_map(client, world, scenario_map)
+
+    alert_model = MoEAlertModel(state_dim=DEFAULT_STATE_DIM)
+    force_arrow = (alert_mode == "fixed")
+
+    try:
+        step_log, _, _ = run_human_episode(
+            client=client,
+            world=world,
+            traj=traj,
+            av_steps=av_steps,
+            alert_model=alert_model,
+            max_duration=300.0,
+            force_arrow=force_arrow,
+            test_mode=(alert_mode == "test"),
+            mini_scenario=ms,
+            session_deadline=None,
+        )
+    finally:
+        _disconnect(world)
+
+    print(f"[test_mode] Human done — {len(step_log)} steps recorded.")
+    if step_log:
+        scores = [s.alert_score for s in step_log]
+        print(f"[test_mode] Mean alert score: {np.mean(scores):.3f}  "
+              f"min={min(scores):.3f}  max={max(scores):.3f}")
+
+
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2288,15 +3224,54 @@ def main() -> None:
                    help="'fixed' forces arrow alert every episode; "
                         "'adaptive' lets the model sample the alert type; "
                         "'test' shows a moving dot along the AV trajectory (no alert) (default: adaptive)")
+    p.add_argument("--tutorial-duration", type=int, default=_TUTORIAL_DURATION,
+                   help=f"Tutorial length in seconds (default: {_TUTORIAL_DURATION}). "
+                        "Set to 0 to skip the tutorial entirely.")
+    p.add_argument("--start-scenario", type=int, default=0,
+                   help="Scenario index to start from; that scenario and all following ones "
+                        "will be included in the session pool (default: 0 = all scenarios). "
+                        "Run with --list-scenarios to see available IDs.")
+    p.add_argument("--headless-av", action="store_true",
+                   help="Run AV pre-run episodes without CARLA rendering (faster). "
+                        "The participant will not see the AV drive during pre-run.")
     p.add_argument("--test", action="store_true",
                    help="Run smoke tests (no CARLA or model needed) then exit")
+    p.add_argument("--test-mode", action="store_true",
+                   help="Debug mode: run AV then human for a single mini-scenario "
+                        "(no calibration, no training loop). "
+                        "Use --scenario-id to pick the scenario.")
+    p.add_argument("--scenario-id", type=int, default=0,
+                   help="Index into MINI_SCENARIOS list for --test-mode (default: 0). "
+                        "Run with --list-scenarios to see available IDs.")
+    p.add_argument("--list-scenarios", action="store_true",
+                   help="Print all available mini-scenario IDs and names then exit")
     args = p.parse_args()
+
+    if args.list_scenarios:
+        print("Available mini-scenarios:")
+        for _idx, _ms in enumerate(MINI_SCENARIOS):
+            print(f"  {_idx:2d}  {_ms.name}  "
+                  f"(base={_ms.base_scenario}, spawn={_ms.spawn_index}, "
+                  f"obstacles={len(_ms.obstacles)})")
+        return
 
     if args.test:
         _run_smoke_test()
         return
 
     model_path = find_model(args.model)   # resolves or raises with a clear message
+
+    if args.test_mode:
+        _run_test_mode(
+            model_path=model_path,
+            scenario_id=args.scenario_id,
+            host=args.host,
+            port=args.port,
+            alert_mode=args.alert_mode,
+            av_speedup=args.av_speedup,
+            calibration_duration=args.calibration_duration,
+        )
+        return
 
     AlertPipeline(
         model_path=model_path,
@@ -2310,6 +3285,9 @@ def main() -> None:
         session_duration=args.session_duration * 60,
         alert_mode=args.alert_mode,
         av_speedup=args.av_speedup,
+        tutorial_duration=args.tutorial_duration,
+        start_scenario=args.start_scenario,
+        headless_av=args.headless_av,
     ).run()
 
 

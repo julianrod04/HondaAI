@@ -36,7 +36,7 @@ class Hyperparameters:
 		self.pretrained_model_path = r"C:\Users\bc35638\Documents\Alert_Test\HondaAI\run\pdmorl_Train_Session_2-16-2026_bestCombined.zip"  # Path to pretrained model for fine-tuning. Empty string = train from scratch. Do NOT include .zip extension.
 
 		self.scenario = False # Can be: "intersection", "traffic_low", "traffic_high", "tunnel", "roundabout", "highway", "crossing", etc.
-		self.scenario_traffic = False  # Enable spawning traffic in scenarios
+		self.scenario_traffic = True  # Enable spawning traffic in scenarios
 		self.evaluate_scenarios = True  # Evaluate agent on predefined scenarios
 		self.training_scenarios = ["traffic_low"]  # List of scenario names to train on (e.g. ["intersection", "highway", "highway_50mph"]). Empty = random town training.
 

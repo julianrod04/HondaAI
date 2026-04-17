@@ -1,0 +1,14 @@
+participant_number,scenario,iteration,driving_score,episode_loss
+7,town02_parked_right,0,0.0,40.75134677261021
+7,town01_tight_gap,1,0.004,30.881951877856043
+7,town01_crash_two_veers,2,0.0,122.14176859981359
+7,town04_crossing_triple,3,0.0,10.918280136710674
+7,town01_crash_with_parked,4,0.001,44.82082483564269
+7,town02_crash_plus_slow_npc,5,0.0,91.83018771763086
+7,town04_crossing_triple,6,0.001,31.06082294948969
+7,town01_tight_gap,7,0.0,30.131537105213727
+7,town02_crash_veer_left,8,0.0,12.48477192788807
+7,town04_crossing_parked_plus_slow,9,0.0,8.494875291258786
+7,town04_crossing_parked_plus_slow,10,0.0,130.2687966634298
+7,town02_three_parked,11,0.0,128.38982334326835
+7,town02_crash_veer_right,12,0.0,10.106662603731596

@@ -460,6 +460,11 @@ class _GatingNetwork(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int) -> None:
         super().__init__()
         self.net = _mlp(state_dim, hidden_dim, NUM_GUI_TYPES, layers=2)
+        # Zero-initialise the final linear layer so all gui_types start with
+        # equal logits (uniform categorical) — prevents early mode collapse.
+        final_linear = self.net[-1]
+        nn.init.zeros_(final_linear.weight)
+        nn.init.zeros_(final_linear.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)  # (B, 3) raw logits
@@ -546,7 +551,8 @@ class MoEAlertModel(nn.Module):
         expert_hidden_dim: int = 64,
         lr: float = 5e-4,
         clip_eps: float = 0.15,
-        entropy_coeff: float = 0.01,
+        entropy_coeff: float = 0.05,
+        exploration_eps: float = 0.15,
         ppo_epochs: int = 12,
         batch_size: int = 16,
         buffer_size: int = 48,
@@ -560,6 +566,7 @@ class MoEAlertModel(nn.Module):
         self.state_dim = state_dim
         self.clip_eps = clip_eps
         self.entropy_coeff = entropy_coeff
+        self.exploration_eps = exploration_eps
         self.ppo_epochs = ppo_epochs
         self.batch_size = batch_size
         self.buffer_size = buffer_size
@@ -641,10 +648,14 @@ class MoEAlertModel(nn.Module):
         state_t = torch.FloatTensor(state).unsqueeze(0)  # (1, D)
 
         with torch.no_grad():
-            # --- GUI type from gating ---
+            # --- GUI type from gating (with epsilon-greedy exploration) ---
             gating_logits = self.gating(state_t)
             gating_dist = Categorical(logits=gating_logits)
-            gui_type = gating_dist.sample()               # (1,)
+            if torch.rand(1).item() < self.exploration_eps:
+                # Force a uniform random gui_type to prevent mode collapse.
+                gui_type = torch.randint(0, NUM_GUI_TYPES, (1,))
+            else:
+                gui_type = gating_dist.sample()           # (1,)
             lp_gui = gating_dist.log_prob(gui_type)       # (1,)
 
             # --- GUI params from selected expert ---

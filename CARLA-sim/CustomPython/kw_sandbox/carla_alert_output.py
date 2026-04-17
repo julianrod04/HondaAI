@@ -98,6 +98,7 @@ class _TrajectoryPoint:
     y: float
     z: float
     yaw: float        # degrees
+    speed: float = 0.0  # m/s magnitude
 
 
 class AVTrajectory:
@@ -118,14 +119,17 @@ class AVTrajectory:
     # ── Recording ──────────────────────────────────────────────────────────
 
     def add(self, sim_time: float, av_vehicle: "carla.Vehicle") -> None:
-        """Append the AV's current position. Call once per world tick."""
+        """Append the AV's current position and speed. Call once per world tick."""
         tf = av_vehicle.get_transform()
+        vel = av_vehicle.get_velocity()
+        speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
         self._points.append(_TrajectoryPoint(
             t=sim_time,
             x=tf.location.x,
             y=tf.location.y,
             z=tf.location.z,
             yaw=tf.rotation.yaw,
+            speed=speed,
         ))
 
     # ── Query ──────────────────────────────────────────────────────────────
@@ -200,6 +204,25 @@ class AVTrajectory:
     def all_positions(self) -> List[Tuple[float, float, float]]:
         """Return all recorded (x, y, z) world-space positions."""
         return [(p.x, p.y, p.z) for p in self._points]
+
+    def get_speed_at(self, t: float) -> float:
+        """Return interpolated AV speed (m/s) at time t."""
+        if not self._points:
+            return 0.0
+        if t <= self._points[0].t:
+            return self._points[0].speed
+        if t >= self._points[-1].t:
+            return self._points[-1].speed
+        lo, hi = 0, len(self._points) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if self._points[mid].t <= t:
+                lo = mid
+            else:
+                hi = mid
+        a, b = self._points[lo], self._points[hi]
+        alpha = (t - a.t) / max(b.t - a.t, 1e-9)
+        return a.speed + alpha * (b.speed - a.speed)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,11 @@
+participant_number,scenario,iteration,driving_score,episode_loss
+64,town01_crash_with_parked,0,0.87,-0.6158274344422602
+64,town04_crossing_block,1,0.08,-0.8902353766182112
+64,town02_three_parked,2,0.71,-0.4631536060737239
+64,town01_close_pair,3,0.84,-0.400166213385422
+64,town04_crossing_triple,4,0.13,-0.256308826209904
+64,town04_highway_shoulder,5,0.12,-0.025545689723609634
+64,town04_highway_shoulder_trio,6,0.09,-0.02277101505185581
+64,town02_parked_plus_slow,7,0.82,0.05638896428699342
+64,town02_crash_veer_right,8,0.85,-0.08784241246003484
+64,town04_crossing_triple,9,0.13,-0.1182246931873831
