@@ -1,0 +1,15 @@
+participant_number,scenario,iteration,driving_score,episode_loss,style_speed,style_efficiency,style_aggressiveness,style_comfort,gui_type,gui_location,gui_color,gui_vibration,gui_lag,gui_p0_name,gui_p0_val,gui_p1_name,gui_p1_val,gui_p2_name,gui_p2_val
+105,town02_parked_right,0,0.0,54.242960167444714,0.314,0.0035,0.0,0.9943,arrow,windshield,colorblind,False,0.937,scale,0.496,opacity,0.5216,vibration_dist,0.4488
+105,town01_tight_gap,1,0.002,59.94325751847096,0.4255,0.0144,0.0025,0.9844,route,windshield,RGB,False,1.073,line_width,0.5487,opacity,0.4499,vibration_dist,0.587
+105,town01_crash_two_veers,2,0.0,94.6269590318653,0.3142,0.0024,0.0,0.9963,arrow,windshield,RGB,True,1.22,scale,0.337,opacity,0.5115,vibration_dist,0.5119
+105,town04_crossing_triple,3,0.0,63.97518611993028,0.7417,0.5526,0.2617,0.9209,arrow,windshield,RGB,False,0.968,scale,0.3684,opacity,0.454,vibration_dist,0.5096
+105,town01_crash_with_parked,4,0.378,43.07491238258228,0.8471,0.7612,0.1091,0.9391,arrow,panel,colorblind,False,1.078,scale,0.3841,opacity,0.4922,vibration_dist,0.7942
+105,town02_crash_plus_slow_npc,5,0.391,40.81147227368377,0.8093,0.8104,0.162,0.9473,arrow,windshield,colorblind,False,0.969,scale,0.4562,opacity,0.5761,vibration_dist,0.6931
+105,town04_crossing_triple,6,0.505,30.899796079782064,0.6337,0.6931,0.1766,0.947,route,windshield,colorblind,False,0.751,line_width,0.4801,opacity,0.3813,vibration_dist,0.712
+105,town01_tight_gap,7,0.412,29.713707877767003,0.8727,0.8313,0.093,0.9252,route,windshield,colorblind,False,0.662,line_width,0.4352,opacity,0.166,vibration_dist,0.7571
+105,town02_crash_veer_left,8,0.508,18.788143907100423,0.8235,0.8544,0.2137,0.94,route,windshield,colorblind,False,0.991,line_width,0.5202,opacity,0.346,vibration_dist,0.6106
+105,town04_crossing_parked_plus_slow,9,0.446,16.094630163103417,0.7693,0.8409,0.1678,0.9538,route,windshield,colorblind,False,1.121,line_width,0.5899,opacity,0.1508,vibration_dist,0.6459
+105,town04_crossing_parked_plus_slow,10,0.454,23.89244935749936,0.7888,0.8198,0.1629,0.9418,route,windshield,colorblind,False,0.852,line_width,0.4699,opacity,0.1158,vibration_dist,0.6185
+105,town02_three_parked,11,0.115,44.8684545833327,0.6567,0.668,0.1797,0.9277,sound,windshield,RGB,True,1.037,lateral_threshold,0.7136,cooldown,0.2214,volume,0.8092
+105,town02_crash_veer_right,12,0.284,42.943656742188566,0.8457,0.7636,0.1387,0.9241,sound,windshield,RGB,False,1.083,lateral_threshold,0.4458,cooldown,0.2246,volume,0.026
+105,town04_crossing_parked_plus_slow,13,0.105,61.88027907207142,0.5851,0.602,0.0766,0.9469,sound,windshield,RGB,True,1.143,lateral_threshold,0.2104,cooldown,0.0171,volume,0.2854

@@ -219,3 +219,5 @@ __marimo__/
 # Large binary files — stored outside the repo
 run/
 sb3/wandb/
+
+# csv/png 
