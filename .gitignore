@@ -217,7 +217,10 @@ marimo/_lsp/
 __marimo__/
 
 # Large binary files — stored outside the repo
-run/
+run/*
+!run/pdmorl_Train_Session_2-16-2026_bestCombined.zip
 sb3/wandb/
 
 # csv/png 
+.csv
+.png
